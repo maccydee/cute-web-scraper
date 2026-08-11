@@ -58,6 +58,10 @@ _CHALLENGE_SIGNATURES = (
     # markers, so nothing else catches it and the wall came back as if it were
     # the page.
     "Before you continue to Google",
+    # Booking.com's bot check, served with HTTP 202 — outside the block statuses
+    # entirely, so only the body reveals it.
+    "verify that you're not a robot",
+    "verify that you&#x27;re not a robot",
 )
 """Every entry is specific enough that ordinary prose cannot trigger it. Matching the
 bare phrase 'Just a moment' would silently blank real pages."""

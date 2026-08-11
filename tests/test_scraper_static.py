@@ -387,3 +387,17 @@ async def test_google_consent_wall_is_a_block(httpx_mock):
         result = await s.fetch("https://www.google.com/maps/place/x")
     assert result.blocked is True
     assert result.block_reason == "challenge"
+
+
+async def test_bot_check_under_an_unusual_status_is_a_block(httpx_mock):
+    """Booking.com serves its bot check with HTTP 202, which is not a block status
+    at all, so only the body reveals it."""
+    httpx_mock.add_response(
+        status_code=202,
+        html="<html><body><p>JavaScript is disabled. In order to continue, we need to "
+        "verify that you're not a robot.</p></body></html>",
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://booking.example")
+    assert result.blocked is True
+    assert result.block_reason == "challenge"
