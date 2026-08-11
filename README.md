@@ -51,13 +51,20 @@ Scrape every product from https://example-shop.com and give me a CSV of name and
 | `extract_shopify_store` | A whole Shopify catalogue, one row per variant |
 | `list_shopify_collections` | A Shopify store's collections and their product counts |
 
+**Places and local businesses**
+
+| Tool | What it does |
+|---|---|
+| `find_places` | Search by name or description — name, address, coordinates, phone, website, opening hours |
+| `find_places_nearby` | Every business of a category within a radius of a place |
+
 **Result tables**
 
 | Tool | What it does |
 |---|---|
 | `list_tables` | Saved result tables with row counts and columns |
 | `get_table` | One table's columns, row count and a sample |
-| `query_table` | Read-only SQL over a saved table — filter, aggregate, group, sort |
+| `query_table` | Read-only SQL over a saved table — filter, aggregate, group, sort, and optionally save the result as a new table |
 | `export_table` | Write a table to CSV or JSON on disk |
 | `drop_table` | Delete a saved table |
 
@@ -87,6 +94,36 @@ FROM catalogue
 The table can hold 100,000 rows and none of them enter the conversation. `query_table` is strictly read-only — it runs against a read-only SQLite handle and rejects anything that is not a `SELECT`, so a query can never modify or delete saved data.
 
 Tables live in a SQLite file at `~/.cute-web-scraper/results.db` (set `SCRAPER_DB_PATH` to move it).
+
+### Cleaning data
+
+`query_table` also takes `save_as`, which persists the result as a new table. SQL already expresses the usual cleanup operations, so there's no separate set of edit tools:
+
+```sql
+SELECT DISTINCT * FROM leads                                  -- deduplicate
+SELECT street || ', ' || city AS address FROM leads           -- merge columns
+SELECT name, phone FROM leads WHERE phone IS NOT NULL         -- drop columns and rows
+SELECT vendor AS brand FROM catalogue                         -- rename
+```
+
+The source table is left untouched unless you deliberately target its own name, and the response says `replaced_existing_table` when you do — so an in-place filter is never a silent loss of rows.
+
+## Places and local businesses
+
+`find_places` looks up a single place; `find_places_nearby` returns everything of a category within a radius, which is the local lead-generation case:
+
+```
+Find every dentist within 4km of Bath, save it as `leads`,
+then tell me how many have a website but no phone number.
+```
+
+Categories accept friendly names (`cafe`, `dentist`, `hotel`, `solicitor`, `gym`, `hairdresser`, …) or a raw OpenStreetMap tag like `amenity=dentist`.
+
+**A note on the data source.** This is OpenStreetMap, not Google Maps. Google was the obvious target and it does not work: an automated browser gets a consent interstitial, and once past that, a degraded map shell with no place panel. Stealth flags didn't change it. Getting through needs residential proxies and challenge solving, which this tool deliberately doesn't do.
+
+OpenStreetMap gives the same fields — name, address, coordinates, phone, website, opening hours, category — through documented open endpoints with no key. The one thing it has no equivalent for is **star ratings and review counts**, which are Google's own proprietary data.
+
+Both endpoints are volunteer-run. Nominatim's policy of one request per second is enforced internally regardless of `SCRAPER_DELAY_MS`, and Overpass queries fall through several public mirrors, because the main instance regularly returns 504 under load.
 
 Tool output is also capped at `SCRAPER_MAX_INLINE_CHARS` (50,000 by default). Past that, a result is truncated with a note pointing at `save_as` — so a single call can't fill your context by accident.
 

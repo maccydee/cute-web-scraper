@@ -77,9 +77,95 @@ def create_server(holder: ScraperHolder) -> MCPServer:
     _register_extract_tools(mcp, holder)
     _register_product_tools(mcp, holder)
     _register_shopify_tools(mcp, holder)
+    _register_place_tools(mcp, holder)
     _register_table_tools(mcp, holder)
     _register_prompts(mcp)
     return mcp
+
+
+# --------------------------------------------------------------------------- places
+
+
+def _register_place_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
+    @mcp.tool(
+        description=(
+            "Search for places and local businesses by name or description — "
+            "'the British Museum', 'cafes in Shoreditch'. Returns name, address, "
+            "coordinates, phone, website, opening hours and category. "
+            "Data comes from OpenStreetMap, so there are no star ratings or review "
+            "counts; for those you would need a paid Google Places key. "
+            "Pass save_as='<table_name>' to store the results."
+        )
+    )
+    async def find_places(query: str, limit: int = 20, save_as: str = "") -> str:
+        from .places import PlacesError, search_places
+
+        scraper = holder.require()
+        try:
+            places = await search_places(query, scraper.http, limit=limit)
+        except PlacesError as exc:
+            return json.dumps({"query": query, "error": str(exc), "results": []})
+        if save_as:
+            return _save_and_summarise(holder, save_as, places, [])
+        return _truncate(
+            json.dumps(
+                {"query": query, "count": len(places), "results": places}, ensure_ascii=False
+            ),
+            holder.max_inline_chars,
+            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        )
+
+    @mcp.tool(
+        description=(
+            "Find every business of a category within a radius of a place — "
+            "'dentists near Bath', 'cafes within 2km of Shoreditch'. This is the tool "
+            "for local lead generation: it returns name, address, phone, website and "
+            "opening hours for each. `category` accepts friendly names (cafe, dentist, "
+            "hotel, solicitor, gym, hairdresser, ...) or a raw OpenStreetMap tag like "
+            "'amenity=dentist'. Data is OpenStreetMap, so there are no star ratings. "
+            "Pass save_as='<table_name>' to store the results."
+        )
+    )
+    async def find_places_nearby(
+        category: str,
+        near: str,
+        radius_m: int = 5000,
+        limit: int = 100,
+        save_as: str = "",
+    ) -> str:
+        from .places import PlacesError, find_nearby, geocode_one
+
+        scraper = holder.require()
+        try:
+            lat, lon, label = await geocode_one(near, scraper.http)
+            places = await find_nearby(
+                category, lat, lon, scraper.http, radius_m=radius_m, limit=limit
+            )
+        except PlacesError as exc:
+            return json.dumps(
+                {"category": category, "near": near, "error": str(exc), "results": []}
+            )
+
+        named = [p for p in places if p.get("name")]
+        if save_as and named:
+            summary = json.loads(_save_and_summarise(holder, save_as, named, []))
+            summary["centre"] = label
+            summary["radius_m"] = radius_m
+            return json.dumps(summary, ensure_ascii=False)
+        return _truncate(
+            json.dumps(
+                {
+                    "category": category,
+                    "centre": label,
+                    "radius_m": radius_m,
+                    "count": len(named),
+                    "results": named,
+                },
+                ensure_ascii=False,
+            ),
+            holder.max_inline_chars,
+            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        )
 
 
 # --------------------------------------------------------------------------- fetch
@@ -412,12 +498,36 @@ def _register_table_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             "aggregate, group and sort a table of any size and get back only the rows you "
             "asked for. Only SELECT is permitted — the query can never modify saved data. "
             "Example: SELECT vendor, COUNT(*) AS n, AVG(price) AS avg_price FROM catalogue "
-            "GROUP BY vendor ORDER BY n DESC."
+            "GROUP BY vendor ORDER BY n DESC.\n\n"
+            "Pass save_as='<table_name>' to persist the query's result as a new table. "
+            "That is how you clean data here: SELECT DISTINCT deduplicates, aliases rename "
+            "columns, `a || ', ' || b AS c` merges them, and WHERE drops unwanted rows — "
+            "all in one step, with the original left untouched unless you deliberately "
+            "target its name."
         )
     )
-    async def query_table(sql: str, max_rows: int = 200) -> str:
+    async def query_table(sql: str, max_rows: int = 200, save_as: str = "") -> str:
+        store = holder.require_store()
+        if save_as:
+            try:
+                info, replaced, truncated = store.query_to_table(sql, save_as)
+            except StoreError as exc:
+                return json.dumps({"error": str(exc)})
+            return json.dumps(
+                {
+                    "saved_to": info.name,
+                    "row_count": info.row_count,
+                    "columns": info.columns,
+                    # Surfaced so a filter that overwrote its own source is visible
+                    # rather than a silent loss of rows.
+                    "replaced_existing_table": replaced,
+                    "truncated": truncated,
+                    "sample": _shrink_sample(store.get_table(info.name, sample=3).sample),
+                },
+                ensure_ascii=False,
+            )
         try:
-            result = holder.require_store().query(sql, max_rows=max_rows)
+            result = store.query(sql, max_rows=max_rows)
         except StoreError as exc:
             return json.dumps({"error": str(exc)})
         return _truncate(

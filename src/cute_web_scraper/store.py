@@ -31,6 +31,7 @@ _WRITE_KEYWORDS = (
     "truncate",
 )
 _DEFAULT_MAX_ROWS = 200
+_MAX_MATERIALISED_ROWS = 100_000
 _EXPORT_FORMATS = ("csv", "json")
 
 
@@ -147,6 +148,37 @@ class ResultStore:
             truncated=truncated,
             total_rows_examined=len(rows),
         )
+
+    def query_to_table(
+        self, sql: str, target: str, max_rows: int = _MAX_MATERIALISED_ROWS
+    ) -> tuple[TableInfo, bool, bool]:
+        """Persist a SELECT's results as `target`.
+
+        Returns (info, replaced, truncated). Because SQL already expresses renaming,
+        merging, deduplicating and filtering, this one operation covers the whole
+        family of table-cleanup edits without ever exposing a write statement.
+        """
+        name = _validate_name(target)
+        statement = _validate_select(sql)
+
+        # Materialise fully through the read-only handle and close it before writing,
+        # so a query that reads the table it targets cannot read its own partial write.
+        conn = self._connect_readonly()
+        try:
+            cursor = conn.execute(statement)
+            fetched = cursor.fetchmany(max_rows + 1)
+        except sqlite3.Error as exc:
+            raise StoreError(f"Query failed: {exc}") from None
+        finally:
+            conn.close()
+
+        truncated = len(fetched) > max_rows
+        rows = [dict(r) for r in fetched[:max_rows]]
+        if not rows:
+            raise StoreError("Query returned no rows, so there is nothing to save.")
+
+        replaced = self._exists(name)
+        return self.save(name, rows), replaced, truncated
 
     def export(self, table: str, fmt: str, dest_dir: Path) -> Path:
         name = _validate_name(table)
