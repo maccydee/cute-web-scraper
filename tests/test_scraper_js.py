@@ -192,3 +192,104 @@ async def test_both_routes_blocked_keeps_the_browser_answer(httpx_mock):
             result = await s.fetch("https://trustpilot.example", js_render=True)
     assert result.blocked is True
     assert result.via == "playwright"
+
+
+# ------------------------------------------------------ stealth: the last resort
+
+
+async def test_403_with_a_full_page_is_not_a_block(httpx_mock):
+    """Trustpilot answers 403 while serving the whole reviews page. Trusting the
+    status alone would blank a megabyte of real content."""
+    body = (
+        "<html><body>"
+        + "<p>"
+        + ("Genuine review copy for a real product. " * 300)
+        + "</p>"
+        + "".join(f'<a href="/reviews/{i}">Review {i}</a>' for i in range(30))
+        + "</body></html>"
+    )
+    httpx_mock.add_response(status_code=403, html=body)
+    async with Scraper(_config(impersonate=False)) as s:
+        result = await s.fetch("https://trustpilot.example")
+    assert result.blocked is False
+    assert "Genuine review copy" in result.markdown
+
+
+async def test_403_with_no_content_is_still_a_block(httpx_mock):
+    httpx_mock.add_response(status_code=403, html="<html><body>Access Denied</body></html>")
+    async with Scraper(_config(impersonate=False)) as s:
+        result = await s.fetch("https://blocked.example")
+    assert result.blocked is True
+    assert result.block_reason == "http_403"
+
+
+async def test_stealth_runs_only_after_everything_else_failed(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+    order: list[str] = []
+
+    async def impersonated(self, url, profile):
+        order.append(f"impersonate:{profile}")
+        return "", 403, "text/html"
+
+    async def stealth(self, url):
+        order.append("stealth")
+        return "<h1>Reviews</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with (
+            patch.object(Scraper, "_fetch_impersonated", new=impersonated),
+            patch.object(Scraper, "_fetch_stealth", new=stealth),
+        ):
+            result = await s.fetch("https://trustpilot.example")
+    assert order == ["impersonate:chrome131", "impersonate:safari17_0", "stealth"]
+    assert result.via == "stealth"
+    assert result.blocked is False
+
+
+async def test_stealth_never_runs_when_an_earlier_tier_worked(httpx_mock):
+    httpx_mock.add_response(html="<h1>Fine</h1>")
+
+    async def stealth(self, url):
+        raise AssertionError("stealth must be a last resort")
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_stealth", new=stealth):
+            result = await s.fetch("https://example.com")
+    assert result.via == "httpx"
+
+
+async def test_stealth_can_be_disabled(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+
+    async def impersonated(self, url, profile):
+        return "", 403, "text/html"
+
+    async def stealth(self, url):
+        raise AssertionError("must not run when disabled")
+
+    async with Scraper(_config(impersonate=True, stealth=False)) as s:
+        with (
+            patch.object(Scraper, "_fetch_impersonated", new=impersonated),
+            patch.object(Scraper, "_fetch_stealth", new=stealth),
+        ):
+            result = await s.fetch("https://blocked.example")
+    assert result.blocked is True
+    assert result.via == "impersonate:exhausted"
+
+
+async def test_a_failing_stealth_tier_is_not_fatal(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+
+    async def impersonated(self, url, profile):
+        return "", 403, "text/html"
+
+    async def stealth(self, url):
+        raise RuntimeError("stealth browser exploded")
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with (
+            patch.object(Scraper, "_fetch_impersonated", new=impersonated),
+            patch.object(Scraper, "_fetch_stealth", new=stealth),
+        ):
+            result = await s.fetch("https://blocked.example")
+    assert result.blocked is True  # reported honestly, not crashed

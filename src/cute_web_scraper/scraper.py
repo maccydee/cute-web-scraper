@@ -1,4 +1,4 @@
-"""Two-tier scraping engine: httpx for static pages, Playwright for JS-rendered pages."""
+"""Layered scraping engine: httpx, TLS impersonation, Playwright, stealth browser."""
 
 from __future__ import annotations
 
@@ -24,6 +24,16 @@ log = logging.getLogger(__name__)
 _TIMEOUT_S = 30.0
 _BLOCK_STATUSES = {403, 429, 503}
 _USER_AGENT = "cute-web-scraper/0.1 (+https://github.com/maccydee/cute-web-scraper)"
+
+_CONTENT_MIN_HTML = 10_000
+_CONTENT_MIN_TEXT = 2_000
+_CONTENT_MIN_LINKS = 10
+"""What counts as a real page when the status code says otherwise. Every genuine
+block observed was under 2KB (ASOS 296 bytes, eBay 1,832, Trustpilot 991), so these
+thresholds sit well clear of them."""
+
+_STEALTH_SETTLE_MS = 4000
+"""How long a stealth render waits for client-side content to populate."""
 
 _IMPERSONATE_PROFILES = ("chrome131", "safari17_0")
 """Tried in order when a plain request is blocked.
@@ -80,6 +90,9 @@ class Scraper:
         self._browser_lock = asyncio.Lock()
         self._impersonate_sessions: dict[str, Any] = {}
         self._warmed: set[tuple[str, str]] = set()
+        self._stealth_browser: Browser | None = None
+        self._stealth_cm: Any = None
+        self._stealth_lock = asyncio.Lock()
 
     async def __aenter__(self) -> Scraper:
         self._client = httpx.AsyncClient(
@@ -99,6 +112,12 @@ class Scraper:
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
+        if self._stealth_browser is not None:
+            await self._stealth_browser.close()
+            self._stealth_browser = None
+        if self._stealth_cm is not None:
+            await self._stealth_cm.__aexit__(None, None, None)
+            self._stealth_cm = None
         for session in self._impersonate_sessions.values():
             try:
                 await session.close()
@@ -157,8 +176,33 @@ class Scraper:
         fallback = await self._fetch_static_escalating(url)
         if not _detect_block(fallback[1], fallback[0])[0]:
             return fallback
-        # Both routes blocked: keep the browser's answer, which is the fuller attempt.
+
+        last_resort = await self._try_stealth(url)
+        if last_resort is not None:
+            return last_resort
+        # Everything blocked: keep the browser's answer, the fuller attempt.
         return html, status, content_type, "playwright"
+
+    async def _try_stealth(self, url: str) -> tuple[str, int, str, str] | None:
+        """Last resort: a browser with its automation tells patched out.
+
+        Trustpilot defeats every other tier — it needs JavaScript (so curl_cffi
+        cannot help) and detects ordinary Playwright. A stealth-patched browser
+        gets the real page, and notably serves it under a 403, which is why block
+        detection has to weigh content rather than status alone.
+        """
+        if not self._config.stealth:
+            return None
+        try:
+            html, status, content_type = await self._fetch_stealth(url)
+        except Exception as exc:  # noqa: BLE001 - last resort, never fatal
+            log.info("Stealth rendering failed for %s: %s", url, _brief(exc))
+            return None
+        if _detect_block(status, html)[0]:
+            log.info("Stealth rendering was blocked too on %s", url)
+            return None
+        log.info("Cleared %s with stealth rendering", url)
+        return html, status, content_type, "stealth"
 
     async def _fetch_static_escalating(self, url: str) -> tuple[str, int, str, str]:
         """Plain request first; on a block, retry with browser TLS fingerprints.
@@ -211,6 +255,9 @@ class Scraper:
                 return retry_html, retry_status, retry_type, f"impersonate:{profile}"
             html, status, content_type = retry_html, retry_status, retry_type
 
+        last_resort = await self._try_stealth(url)
+        if last_resort is not None:
+            return last_resort
         return html, status, content_type, "impersonate:exhausted"
 
     async def _fetch_static(self, url: str) -> tuple[str, int, str]:
@@ -271,6 +318,47 @@ class Scraper:
         content_type = str(response.headers.get("content-type", ""))
         body = response.text if _is_texty(content_type) else ""
         return body, int(response.status_code), content_type
+
+    async def _ensure_stealth_browser(self) -> Browser:
+        async with self._stealth_lock:
+            if self._stealth_browser is not None:
+                return self._stealth_browser
+            from playwright.async_api import async_playwright
+            from playwright_stealth import Stealth
+
+            cm = Stealth().use_async(async_playwright())
+            playwright = await cm.__aenter__()
+            try:
+                browser = await playwright.chromium.launch(
+                    headless=True, args=["--disable-blink-features=AutomationControlled"]
+                )
+            except Exception:
+                await cm.__aexit__(None, None, None)
+                raise
+            self._stealth_cm = cm
+            self._stealth_browser = browser
+            return self._stealth_browser
+
+    async def _fetch_stealth(self, url: str) -> tuple[str, int, str]:
+        browser = await self._ensure_stealth_browser()
+        await self._rate_limiter.wait(url)
+        async with self._semaphore:
+            context = await browser.new_context(
+                locale="en-GB", viewport={"width": 1440, "height": 900}
+            )
+            page = await context.new_page()
+            try:
+                response = await page.goto(url, timeout=int(_TIMEOUT_S * 1000))
+                status = response.status if response is not None else 0
+                content_type = (
+                    response.headers.get("content-type", "") if response is not None else ""
+                )
+                # Client-rendered pages need a beat after navigation to populate.
+                await page.wait_for_timeout(_STEALTH_SETTLE_MS)
+                html = await page.content()
+            finally:
+                await context.close()
+        return html, status, content_type
 
     async def _fetch_rendered(self, url: str) -> tuple[str, int, str]:
         browser = await self._ensure_browser()
@@ -367,6 +455,11 @@ async def _start_playwright() -> Playwright:
     return await async_playwright().start()
 
 
+def _brief(exc: BaseException) -> str:
+    message = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def _origin_of(url: str) -> str:
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc}/"
@@ -379,11 +472,26 @@ def _validate_url(url: str) -> None:
 
 
 def _detect_block(status: int, html: str) -> tuple[bool, str | None]:
-    if status in _BLOCK_STATUSES:
-        return True, f"http_{status}"
+    """A block is a refusal to serve content, not merely an unhappy status code."""
     if any(signature in html for signature in _CHALLENGE_SIGNATURES):
         return True, "challenge"
+    if status in _BLOCK_STATUSES:
+        # Trustpilot answers 403 while still delivering the whole reviews page.
+        # Trusting the status alone would blank a megabyte of real content.
+        if _looks_like_content(html):
+            return False, None
+        return True, f"http_{status}"
     return False, None
+
+
+def _looks_like_content(html: str) -> bool:
+    """True when a body carries enough substance to be the real page."""
+    if len(html) < _CONTENT_MIN_HTML:
+        return False
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+    links = soup.find_all("a", href=True)
+    return len(text) >= _CONTENT_MIN_TEXT and len(links) >= _CONTENT_MIN_LINKS
 
 
 def _is_texty(content_type: str) -> bool:

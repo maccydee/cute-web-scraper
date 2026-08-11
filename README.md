@@ -119,13 +119,13 @@ then tell me how many have a website but no phone number.
 
 Categories accept friendly names (`cafe`, `dentist`, `hotel`, `solicitor`, `gym`, `hairdresser`, …) or a raw OpenStreetMap tag like `amenity=dentist`.
 
-**A note on the data source.** This is OpenStreetMap, not Google Maps. Google was the obvious target and it does not work: an automated browser gets a consent interstitial, and once past that, a degraded map shell with no place panel. Stealth flags didn't change it. Getting through needs residential proxies and challenge solving, which this tool deliberately doesn't do.
+**A note on the data source.** This is OpenStreetMap, not Google Maps. Google was the obvious target and it does not work: an automated browser gets a cookie-consent interstitial, and once past that, a degraded map shell with no place panel. The stealth tier does not help, because this is a consent wall rather than bot detection — a different problem from the one stealth solves.
 
 OpenStreetMap gives the same fields — name, address, coordinates, phone, website, opening hours, category — through documented open endpoints with no key. The one thing it has no equivalent for is **star ratings and review counts**, which are Google's own proprietary data.
 
 Both endpoints are volunteer-run. Nominatim's policy of one request per second is enforced internally regardless of `SCRAPER_DELAY_MS`, and Overpass queries fall through several public mirrors, because the main instance regularly returns 504 under load.
 
-Tool output is also capped at `SCRAPER_MAX_INLINE_CHARS` (50,000 by default). Past that, a result is truncated with a note pointing at `save_as` — so a single call can't fill your context by accident.
+Tool output is also capped at `SCRAPER_MAX_INLINE_CHARS` (25,000 by default). Past that, a result is truncated with a note pointing at `save_as` — so a single call can't fill your context by accident.
 
 ## Example prompts
 
@@ -153,12 +153,18 @@ Everything is an environment variable, with defaults that work unconfigured.
 | `SCRAPER_CACHE_MAX_ENTRIES` | `500` | Cached pages before least-recently-used eviction |
 | `SCRAPER_AUTH_TOKEN` | unset | Bearer token for HTTP mode |
 | `SCRAPER_CHROME_USER_DATA_DIR` | unset | Chrome profile to inherit logged-in sessions from |
+| `SCRAPER_IMPERSONATE` | `1` | Retry blocked requests with browser TLS fingerprints |
+| `SCRAPER_STEALTH` | `1` | Last-resort stealth browser for the hardest blocks |
 | `SCRAPER_DB_PATH` | `~/.cute-web-scraper/results.db` | Where result tables are stored |
-| `SCRAPER_MAX_INLINE_CHARS` | `50000` | Ceiling on how much a single tool returns inline |
+| `SCRAPER_MAX_INLINE_CHARS` | `25000` | Ceiling on how much a single tool returns inline |
 
 ## How it behaves
 
-**Static by default, browser on request.** Most pages are fetched with a plain HTTP client, which is fast. Pass `js_render: true` for single-page apps, infinite-scroll listings and most modern storefronts, and the page is rendered in real Chromium instead.
+**Four tiers, escalating only when refused.** A plain HTTP client handles most pages. If a site refuses, the request retries with real browser TLS fingerprints (Chrome, then Safari), because some sites fingerprint the TLS handshake itself and no header change gets past them. `js_render: true` renders in Chromium for single-page apps. As a last resort, a stealth-patched browser handles sites that need JavaScript *and* reject ordinary automation.
+
+Each tier fixes a different failure, and none is a superset of the others: the TLS tier can't run JavaScript, and Playwright is a detectably automated browser. Every result reports which tier served it. Set `SCRAPER_IMPERSONATE=0` or `SCRAPER_STEALTH=0` to switch the last two off and let blocks stand.
+
+The last two tiers are evasion, not politeness — they exist to get past bot detection that sites deliberately deployed. They only ever run after a refusal, never on a site that served the page normally.
 
 **Adaptive backoff.** Requests to the same domain are spaced by `SCRAPER_DELAY_MS`, measured start to start, so the delay caps the request *rate* rather than adding to slow responses. When a domain pushes back — a 429, a 403, a Cloudflare challenge — the delay for that domain doubles, up to 60 seconds, and decays back down once requests succeed again. Domains are tracked independently, so scraping two sites at once costs nothing extra.
 
@@ -182,7 +188,7 @@ It binds `127.0.0.1` and exposes `/mcp` plus a `/health` endpoint. Binding anywh
 
 ## Limitations
 
-- No proxy rotation and no CAPTCHA solving. Sites with serious bot defences will block it, and it will back off rather than fight.
+- No proxy rotation and no CAPTCHA solving. A site that survives all four tiers is reported as blocked rather than guessed at.
 - LinkedIn and similar may need `SCRAPER_CHROME_USER_DATA_DIR` pointed at a logged-in Chrome profile.
 - `SCRAPER_DELAY_MS=0` removes the polite delay, but backoff still engages when a site pushes back.
 - Phone extraction is deliberately conservative: it requires a country code or a trunk prefix, so it misses some bare local formats rather than returning years and order numbers.

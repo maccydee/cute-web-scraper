@@ -44,6 +44,13 @@ class Config:
     let blocks stand.
     """
 
+    stealth: bool = True
+    """Last-resort tier: a browser with its automation markers patched out.
+
+    Only ever runs after every other tier has been refused. Set SCRAPER_STEALTH=0
+    to disable it and let those blocks stand.
+    """
+
     db_path: Path = field(default_factory=lambda: Path(_DEFAULT_DB_PATH).expanduser())
     """SQLite file holding saved result tables."""
 
@@ -70,6 +77,7 @@ class Config:
             auth_token=_str_env("SCRAPER_AUTH_TOKEN"),
             user_data_dir=_str_env("SCRAPER_CHROME_USER_DATA_DIR"),
             impersonate=_bool_env("SCRAPER_IMPERSONATE", default=True),
+            stealth=_bool_env("SCRAPER_STEALTH", default=True),
             cache_ttl_s=cache_ttl_s,
             cache_max_entries=cache_max_entries,
             db_path=Path(raw_db).expanduser(),
