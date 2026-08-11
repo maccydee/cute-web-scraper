@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cute-web-scraper"
+version = "0.1.0"
+description = "A cute MCP server that gives Claude web scraping powers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "maccydee" }]
+keywords = ["mcp", "claude", "scraping", "playwright"]
+dependencies = [
+    "mcp>=2.0.0",
+    "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "markdownify>=0.13.0",
+    "playwright>=1.45.0",
+    "starlette>=0.40.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-httpx>=0.30.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+    "types-beautifulsoup4",
+]
+
+[project.urls]
+Homepage = "https://github.com/maccydee/cute-web-scraper"
+
+[project.scripts]
+cute-web-scraper = "cute_web_scraper.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cute_web_scraper"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Integration tests hit the live internet. Excluded by default so CI and a bare
+# `pytest` stay hermetic; run them explicitly with `pytest -m integration`.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: real network calls; run with `pytest -m integration`",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["markdownify.*"]
+ignore_missing_imports = true
