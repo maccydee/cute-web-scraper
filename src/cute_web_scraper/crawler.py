@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
 
 import httpx
+from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,11 @@ _PLATFORM_SIGNALS: dict[str, tuple[str, ...]] = {
     "wix": ("wix.com", "x-wix-"),
     "webflow": ("webflow.com", "Webflow"),
 }
+_SHELL_MIN_HTML = 500
+_SHELL_MAX_TEXT = 200
+_SHELL_MAX_LINKS = 3
+"""Thresholds for spotting an unrendered shell: real markup, almost no content."""
+
 _JS_SIGNALS = (
     "__NEXT_DATA__",
     "window.__NUXT__",
@@ -143,4 +149,19 @@ def detect_platform(html: str, headers: dict[str, str]) -> str:
 
 
 def detect_requires_js(html: str) -> bool:
-    return any(signal in html for signal in _JS_SIGNALS)
+    """True when the page needs a browser to produce its content.
+
+    Framework markers catch the common cases, but not all of them: Reddit's shell
+    carries none of them and still renders entirely client-side, so it was reported
+    as static while returning a page whose whole body text was the word "Reddit".
+    The structural check covers any framework — a document with markup but almost
+    no text and no links has not been rendered yet.
+    """
+    if any(signal in html for signal in _JS_SIGNALS):
+        return True
+    if len(html) < _SHELL_MIN_HTML:
+        return False
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+    links = soup.find_all("a", href=True)
+    return len(text) < _SHELL_MAX_TEXT and len(links) < _SHELL_MAX_LINKS

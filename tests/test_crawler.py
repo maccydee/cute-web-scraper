@@ -91,3 +91,31 @@ def test_detect_wix_from_header_name():
 def test_detect_requires_js():
     assert detect_requires_js('<script id="__NEXT_DATA__">{}</script>') is True
     assert detect_requires_js("<p>plain</p>") is False
+
+
+def test_detect_requires_js_framework_markers():
+    assert detect_requires_js('<script id="__NEXT_DATA__">{}</script>') is True
+    assert detect_requires_js("<div data-reactroot></div>") is True
+
+
+def test_detect_shell_without_framework_markers():
+    """Found live: Reddit's shell has no known marker and renders entirely
+    client-side, so marker-matching alone reported it as static."""
+    shell = "<html><head><title>Reddit</title></head><body>" + "<div></div>" * 80 + "</body></html>"
+    assert detect_requires_js(shell) is True
+
+
+def test_real_content_is_not_mistaken_for_a_shell():
+    page = (
+        "<html><body>"
+        + "<p>"
+        + ("Real article text. " * 40)
+        + "</p>"
+        + "".join(f'<a href="/p{i}">Link {i}</a>' for i in range(8))
+        + "</body></html>"
+    )
+    assert detect_requires_js(page) is False
+
+
+def test_tiny_page_is_not_flagged():
+    assert detect_requires_js("<html><body><p>hi</p></body></html>") is False
