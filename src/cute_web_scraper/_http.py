@@ -60,10 +60,14 @@ def check_bind_is_safe(host: str, config: Config) -> None:
         )
 
 
+async def _health(_request: Request) -> Response:
+    return JSONResponse({"status": "ok", "version": __version__})
+
+
 def build_app(config: Config, mcp: MCPServer) -> Starlette:
-    @mcp.custom_route("/health", methods=["GET"])
-    async def health(_request: Request) -> Response:
-        return JSONResponse({"status": "ok", "version": __version__})
+    # MCPServer.custom_route is untyped in the SDK, so apply it as a plain call
+    # rather than a decorator; that keeps _health's own signature checked.
+    mcp.custom_route("/health", methods=["GET"])(_health)
 
     app = mcp.streamable_http_app()
     if config.auth_token:
