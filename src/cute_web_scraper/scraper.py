@@ -54,6 +54,10 @@ _CHALLENGE_SIGNATURES = (
     "Pardon our interruption",
     "Checking your browser before you access",
     "Checking your browser before accessing",
+    # Google's cookie-consent interstitial. Served with HTTP 200 and no challenge
+    # markers, so nothing else catches it and the wall came back as if it were
+    # the page.
+    "Before you continue to Google",
 )
 """Every entry is specific enough that ordinary prose cannot trigger it. Matching the
 bare phrase 'Just a moment' would silently blank real pages."""
@@ -472,16 +476,25 @@ def _validate_url(url: str) -> None:
 
 
 def _detect_block(status: int, html: str) -> tuple[bool, str | None]:
-    """A block is a refusal to serve content, not merely an unhappy status code."""
-    if any(signature in html for signature in _CHALLENGE_SIGNATURES):
-        return True, "challenge"
-    if status in _BLOCK_STATUSES:
-        # Trustpilot answers 403 while still delivering the whole reviews page.
-        # Trusting the status alone would blank a megabyte of real content.
-        if _looks_like_content(html):
-            return False, None
-        return True, f"http_{status}"
-    return False, None
+    """A block is a refusal to serve content, not merely a suspicious signal.
+
+    Both available signals lie in both directions:
+
+      * eBay serves an interstitial under HTTP 200, so status alone misses blocks.
+      * Trustpilot serves a whole reviews page under HTTP 403.
+      * Cloudflare injects /cdn-cgi/challenge-platform into pages it *successfully*
+        serves, so a marker alone flagged a real 716KB Waterstones page as blocked.
+
+    So neither signal decides on its own. If the body carries a real page, it is a
+    real page, whatever the status code and whatever scripts are embedded in it.
+    """
+    challenged = any(signature in html for signature in _CHALLENGE_SIGNATURES)
+    refused = status in _BLOCK_STATUSES
+    if not (challenged or refused):
+        return False, None
+    if _looks_like_content(html):
+        return False, None
+    return (True, "challenge") if challenged else (True, f"http_{status}")
 
 
 def _looks_like_content(html: str) -> bool:

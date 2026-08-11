@@ -342,3 +342,48 @@ async def test_interstitial_keeps_the_escalation_going(httpx_mock):
     assert tried == ["chrome131", "safari17_0"]
     assert result.via == "impersonate:safari17_0"
     assert result.blocked is False
+
+
+async def test_cloudflare_script_on_a_real_page_is_not_a_block(httpx_mock):
+    """Cloudflare injects /cdn-cgi/challenge-platform into pages it successfully
+    serves. Found live: a real 716KB Waterstones page was flagged as blocked."""
+    body = (
+        "<html><head><title>Atomic Habits | Waterstones</title>"
+        '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>'
+        "</head><body>"
+        + "<p>"
+        + ("Real book description copy. " * 400)
+        + "</p>"
+        + "".join(f'<a href="/book/{i}">Book {i}</a>' for i in range(40))
+        + "</body></html>"
+    )
+    httpx_mock.add_response(status_code=200, html=body)
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://waterstones.example")
+    assert result.blocked is False
+    assert "Real book description copy" in result.markdown
+
+
+async def test_challenge_page_without_content_is_still_a_block(httpx_mock):
+    httpx_mock.add_response(
+        status_code=403,
+        html='<html><body><script src="/cdn-cgi/challenge-platform/x"></script>'
+        "<p>Checking your browser</p></body></html>",
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://blocked.example")
+    assert result.blocked is True
+    assert result.block_reason == "challenge"
+
+
+async def test_google_consent_wall_is_a_block(httpx_mock):
+    """Served with HTTP 200 and no challenge markers, so nothing else caught it."""
+    httpx_mock.add_response(
+        status_code=200,
+        html="<html><head><title>Before you continue to Google Maps</title></head>"
+        "<body><p>Before you continue to Google Maps</p></body></html>",
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://www.google.com/maps/place/x")
+    assert result.blocked is True
+    assert result.block_reason == "challenge"
