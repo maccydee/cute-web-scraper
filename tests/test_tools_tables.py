@@ -143,7 +143,7 @@ async def test_save_as_with_no_usable_rows(mcp, holder):
     holder.set(AsyncMock(fetch=AsyncMock(side_effect=RuntimeError("down"))))
     payload = await _json(mcp, "fetch_pages", {"urls": ["https://a.com"], "save_as": "t"})
     assert payload["row_count"] == 0
-    assert payload["errors"][0]["error"] == "down"
+    assert payload["errors"][0]["error"] == "RuntimeError: down"
 
 
 # -------------------------------------------------------------- truncation guard

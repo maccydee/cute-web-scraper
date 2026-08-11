@@ -94,3 +94,18 @@ async def test_fetch_pages_returns_results_and_errors(mcp, holder):
     assert payload["results"][0]["blocked"] is False
     assert len(payload["errors"]) == 1
     assert payload["errors"][0]["url"] == "https://bad.com"
+
+
+async def test_error_without_a_message_still_names_the_failure(mcp, holder):
+    """Found live on asos.com: httpx raises ReadTimeout('') and str(exc) is empty,
+    so the tool reported 'Error fetching https://...: ' and said nothing useful."""
+    holder.set(AsyncMock(fetch=AsyncMock(side_effect=httpx.ReadTimeout(""))))
+    text = await _text(mcp, "fetch_page", {"url": "https://slow.example"})
+    assert "ReadTimeout" in text
+    assert not text.rstrip().endswith(":")
+
+
+async def test_batch_error_without_a_message_names_the_failure(mcp, holder):
+    holder.set(AsyncMock(fetch=AsyncMock(side_effect=httpx.ConnectTimeout(""))))
+    payload = json.loads(await _text(mcp, "fetch_pages", {"urls": ["https://slow.example"]}))
+    assert payload["errors"][0]["error"] == "ConnectTimeout"

@@ -104,7 +104,7 @@ def _register_place_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             places = await search_places(query, scraper.http, limit=limit)
         except PlacesError as exc:
-            return json.dumps({"query": query, "error": str(exc), "results": []})
+            return json.dumps({"query": query, "error": _describe(exc), "results": []})
         if save_as:
             return _save_and_summarise(holder, save_as, places, [])
         return _truncate(
@@ -143,7 +143,7 @@ def _register_place_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             )
         except PlacesError as exc:
             return json.dumps(
-                {"category": category, "near": near, "error": str(exc), "results": []}
+                {"category": category, "near": near, "error": _describe(exc), "results": []}
             )
 
         named = [p for p in places if p.get("name")]
@@ -185,7 +185,7 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             result = await holder.require().fetch(url, js_render=js_render)
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller as text
             log.error("tool=fetch_page failed: %s", exc)
-            return f"Error fetching {url}: {exc}"
+            return f"Error fetching {url}: {_describe(exc)}"
         return _truncate(_render_page(result), holder.max_inline_chars)
 
     @mcp.tool(
@@ -245,7 +245,7 @@ def _register_discovery_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
                 source = "links"
         except Exception as exc:  # noqa: BLE001
             log.error("tool=crawl_site failed: %s", exc)
-            return json.dumps({"url": url, "error": str(exc), "urls": []})
+            return json.dumps({"url": url, "error": _describe(exc), "urls": []})
 
         truncated = len(urls) > limit
         return json.dumps(
@@ -273,7 +273,7 @@ def _register_discovery_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             page = await scraper.fetch(url)
         except Exception as exc:  # noqa: BLE001
-            return json.dumps({"url": url, "error": str(exc)})
+            return json.dumps({"url": url, "error": _describe(exc)})
 
         try:
             sitemap_urls = await discover_sitemap_urls(url, scraper.http)
@@ -397,7 +397,7 @@ def _register_shopify_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             collections = await fetch_collections(store_url, scraper.http)
         except ShopifyError as exc:
-            return json.dumps({"store_url": store_url, "error": str(exc)})
+            return json.dumps({"store_url": store_url, "error": _describe(exc)})
         return json.dumps(
             {"store_url": store_url, "count": len(collections), "collections": collections},
             ensure_ascii=False,
@@ -421,7 +421,7 @@ def _register_shopify_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
                 store_url, scraper.http, max_products=max_products or None
             )
         except ShopifyError as exc:
-            return json.dumps({"store_url": store_url, "error": str(exc)})
+            return json.dumps({"store_url": store_url, "error": _describe(exc)})
 
         rows = variant_rows(products, store_url)
         if not rows:
@@ -477,7 +477,7 @@ def _register_table_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             info = holder.require_store().get_table(name, sample=sample)
         except StoreError as exc:
-            return json.dumps({"name": name, "error": str(exc)})
+            return json.dumps({"name": name, "error": _describe(exc)})
         return _truncate(
             json.dumps(
                 {
@@ -512,7 +512,7 @@ def _register_table_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             try:
                 info, replaced, truncated = store.query_to_table(sql, save_as)
             except StoreError as exc:
-                return json.dumps({"error": str(exc)})
+                return json.dumps({"error": _describe(exc)})
             return json.dumps(
                 {
                     "saved_to": info.name,
@@ -529,7 +529,7 @@ def _register_table_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             result = store.query(sql, max_rows=max_rows)
         except StoreError as exc:
-            return json.dumps({"error": str(exc)})
+            return json.dumps({"error": _describe(exc)})
         return _truncate(
             json.dumps(
                 {
@@ -555,7 +555,7 @@ def _register_table_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             path = holder.require_store().export(name, fmt, target_dir)
         except StoreError as exc:
-            return json.dumps({"name": name, "error": str(exc)})
+            return json.dumps({"name": name, "error": _describe(exc)})
         return json.dumps(
             {"name": name, "format": fmt.lower(), "path": str(path), "bytes": path.stat().st_size}
         )
@@ -570,7 +570,7 @@ def _register_table_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         try:
             info = holder.require_store().get_table(name, sample=0)
         except StoreError as exc:
-            return json.dumps({"name": name, "error": str(exc)})
+            return json.dumps({"name": name, "error": _describe(exc)})
         holder.require_store().drop(name)
         return json.dumps({"name": name, "dropped": True, "rows_deleted": info.row_count})
 
@@ -657,7 +657,7 @@ async def _gather_pages(
     errors: list[dict[str, str]] = []
     for url, outcome in zip(urls, settled, strict=True):
         if isinstance(outcome, BaseException):
-            errors.append({"url": url, "error": str(outcome)})
+            errors.append({"url": url, "error": _describe(outcome)})
         elif outcome.blocked:
             errors.append({"url": url, "error": f"blocked: {outcome.block_reason}"})
         else:
@@ -680,7 +680,7 @@ def _save_and_summarise(
     try:
         info = holder.require_store().save(table, rows)
     except StoreError as exc:
-        return json.dumps({"error": str(exc), "errors": errors})
+        return json.dumps({"error": _describe(exc), "errors": errors})
     sample = holder.require_store().get_table(info.name, sample=3).sample
     return json.dumps(
         {
@@ -707,6 +707,17 @@ def _shrink_sample(rows: list[dict[str, Any]], field_cap: int = 200) -> list[dic
                 item[key] = value
         shrunk.append(item)
     return shrunk
+
+
+def _describe(exc: BaseException) -> str:
+    """A readable description of a failure, even when the exception carries no message.
+
+    httpx raises ReadTimeout('') among others, so str(exc) alone produces an empty
+    string and an error like "Error fetching https://...: " that says nothing.
+    """
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
 
 
 def _truncate(payload: str, max_chars: int, hint: str = "") -> str:

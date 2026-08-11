@@ -140,3 +140,34 @@ def test_drop_table(store):
     store.save("t", ROWS)
     store.drop("t")
     assert store.list_tables() == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # REPLACE() is a read-only string function, not REPLACE INTO. Found live.
+        "SELECT REPLACE(title, ' - BBC News', '') AS headline FROM t",
+        # Write keywords inside string literals are data, not statements.
+        "SELECT * FROM t WHERE title = 'delete'",
+        "SELECT * FROM t WHERE title LIKE '%update%'",
+        "SELECT * FROM t WHERE title IN ('drop', 'create')",
+    ],
+)
+def test_legitimate_queries_are_not_blocked(store, sql):
+    store.save("t", [{"title": "x", "price": 1.0}])
+    store.query(sql)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM t WHERE 1=1; DROP TABLE t",
+        "REPLACE INTO t VALUES ('x', 1)",
+        "WITH x AS (SELECT 1) DELETE FROM t",
+    ],
+)
+def test_write_attempts_still_rejected_after_literal_stripping(store, sql):
+    store.save("t", [{"title": "x", "price": 1.0}])
+    with pytest.raises(StoreError):
+        store.query(sql)
+    assert store.get_table("t").row_count == 1

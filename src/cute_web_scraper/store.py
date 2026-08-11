@@ -22,7 +22,6 @@ _WRITE_KEYWORDS = (
     "drop",
     "alter",
     "create",
-    "replace",
     "attach",
     "detach",
     "pragma",
@@ -30,6 +29,16 @@ _WRITE_KEYWORDS = (
     "reindex",
     "truncate",
 )
+"""Defence in depth only — the read-only connection is the actual guarantee.
+
+`replace` is deliberately absent: REPLACE(str, from, to) is an ordinary read-only
+string function, and `REPLACE INTO` cannot appear here anyway because a statement
+must already begin with SELECT or WITH.
+"""
+
+_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+"""Literals are blanked before keyword scanning, so `WHERE action = 'delete'` and
+`LIKE '%update%'` are not mistaken for write statements."""
 _DEFAULT_MAX_ROWS = 200
 _MAX_MATERIALISED_ROWS = 100_000
 _EXPORT_FORMATS = ("csv", "json")
@@ -232,8 +241,9 @@ def _validate_select(sql: str) -> str:
     lowered = statement.lower()
     if not (lowered.startswith("select") or lowered.startswith("with")):
         raise StoreError("Only SELECT queries are allowed; this tool never modifies saved data.")
+    scannable = _STRING_LITERAL_RE.sub("''", lowered)
     for keyword in _WRITE_KEYWORDS:
-        if re.search(rf"\b{keyword}\b", lowered):
+        if re.search(rf"\b{keyword}\b", scannable):
             raise StoreError(
                 f"Rejected: {keyword.upper()} is not permitted. query_table is read-only."
             )
