@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
@@ -25,13 +25,25 @@ _TIMEOUT_S = 30.0
 _BLOCK_STATUSES = {403, 429, 503}
 _USER_AGENT = "cute-web-scraper/0.1 (+https://github.com/maccydee/cute-web-scraper)"
 
+_IMPERSONATE_PROFILES = ("chrome131", "safari17_0")
+"""Tried in order when a plain request is blocked.
+
+Not one magic value: ASOS clears with the Chrome fingerprint while eBay rejects
+Chrome and accepts Safari, so the fallback has to try more than one.
+"""
+
 _CHALLENGE_SIGNATURES = (
+    # Cloudflare
     "cf-browser-verification",
     "/cdn-cgi/challenge-platform",
     "__cf_chl",
     "<title>Just a moment",
-    "Checking your browser before accessing",
     "Attention Required! | Cloudflare",
+    # Akamai. eBay serves this with HTTP 200, so status alone never catches it —
+    # without these the scraper accepts a 13KB interstitial as if it were the page.
+    "Pardon our interruption",
+    "Checking your browser before you access",
+    "Checking your browser before accessing",
 )
 """Every entry is specific enough that ordinary prose cannot trigger it. Matching the
 bare phrase 'Just a moment' would silently blank real pages."""
@@ -49,6 +61,8 @@ class FetchResult:
     content_type: str
     blocked: bool
     block_reason: str | None
+    via: str = "httpx"
+    """Which tier fetched this: httpx, playwright, or impersonate:<profile>."""
     from_cache: bool = False
 
 
@@ -64,6 +78,8 @@ class Scraper:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._browser_lock = asyncio.Lock()
+        self._impersonate_sessions: dict[str, Any] = {}
+        self._warmed: set[tuple[str, str]] = set()
 
     async def __aenter__(self) -> Scraper:
         self._client = httpx.AsyncClient(
@@ -83,6 +99,13 @@ class Scraper:
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
+        for session in self._impersonate_sessions.values():
+            try:
+                await session.close()
+            except Exception:  # noqa: BLE001 - closing must not mask a real error
+                log.debug("Failed to close an impersonation session", exc_info=True)
+        self._impersonate_sessions.clear()
+        self._warmed.clear()
 
     @property
     def http(self) -> httpx.AsyncClient:
@@ -102,12 +125,66 @@ class Scraper:
 
         if js_render:
             html, status, content_type = await self._fetch_rendered(url)
+            via = "playwright"
         else:
-            html, status, content_type = await self._fetch_static(url)
+            html, status, content_type, via = await self._fetch_static_escalating(url)
 
-        result = self._build_result(url, html, status, content_type)
+        result = self._build_result(url, html, status, content_type, via)
         self._cache.put(url, js_render, result)
         return result
+
+    async def _fetch_static_escalating(self, url: str) -> tuple[str, int, str, str]:
+        """Plain request first; on a block, retry with browser TLS fingerprints.
+
+        Some sites (ASOS, eBay) do not inspect the User-Agent at all — they
+        fingerprint the TLS handshake itself, which no header or headless-browser
+        flag can change. Escalating through real browser fingerprints clears that,
+        and costs nothing on the ~95% of sites that never block in the first place.
+        """
+        try:
+            html, status, content_type = await self._fetch_static(url)
+        except httpx.HTTPError as exc:
+            # A refusal is not always an HTTP status. ASOS drops the connection
+            # outright rather than answering 403, so a transport error is itself a
+            # signal to escalate rather than a reason to give up.
+            if not self._config.impersonate:
+                raise
+            log.info("%s on %s; escalating to browser TLS fingerprints", type(exc).__name__, url)
+            escalated = await self._escalate(url, fallback=("", 0, ""), after_error=True)
+            if escalated[1] == 0:
+                # Nothing answered at all. Returning an empty body here would look
+                # like a successful blank page, so surface the original failure.
+                raise
+            return escalated
+
+        if not self._config.impersonate:
+            return html, status, content_type, "httpx"
+        blocked, _ = _detect_block(status, html)
+        if not blocked:
+            return html, status, content_type, "httpx"
+        return await self._escalate(url, fallback=(html, status, content_type))
+
+    async def _escalate(
+        self, url: str, *, fallback: tuple[str, int, str], after_error: bool = False
+    ) -> tuple[str, int, str, str]:
+        html, status, content_type = fallback
+        reason = "connection refused" if after_error else "blocked"
+
+        for profile in _IMPERSONATE_PROFILES:
+            log.info("%s on %s; trying the %s TLS fingerprint", reason.capitalize(), url, profile)
+            try:
+                retry = await self._fetch_impersonated(url, profile)
+            except Exception as exc:  # noqa: BLE001 - fall through to the next profile
+                log.debug("Impersonation with %s failed for %s: %s", profile, url, exc)
+                continue
+            retry_html, retry_status, retry_type = retry
+            still_blocked, _ = _detect_block(retry_status, retry_html)
+            if not still_blocked:
+                log.info("Cleared the block on %s using %s", url, profile)
+                return retry_html, retry_status, retry_type, f"impersonate:{profile}"
+            html, status, content_type = retry_html, retry_status, retry_type
+
+        return html, status, content_type, "impersonate:exhausted"
 
     async def _fetch_static(self, url: str) -> tuple[str, int, str]:
         await self._rate_limiter.wait(url)
@@ -118,6 +195,55 @@ class Scraper:
         # Decoding a PDF or image as text produces garbage; skip the body entirely.
         body = response.text if _is_texty(content_type) else ""
         return body, response.status_code, content_type
+
+    async def _impersonate_session(self, profile: str) -> Any:
+        """One long-lived curl_cffi session per profile, so cookies persist."""
+        from curl_cffi.requests import AsyncSession
+
+        session = self._impersonate_sessions.get(profile)
+        if session is None:
+            session = AsyncSession()
+            self._impersonate_sessions[profile] = session
+        return session
+
+    async def _warm(self, session: Any, url: str, profile: str) -> None:
+        """Visit a site's origin once before its inner pages.
+
+        A cold request often gets a stub: eBay's search page came back as 13KB of
+        interstitial on a fresh session but 2.1MB of results once the session had
+        picked up the cookies the homepage sets. Browsers get this for free by
+        virtue of having been there before.
+        """
+        origin = _origin_of(url)
+        key = (profile, origin)
+        if key in self._warmed:
+            return
+        self._warmed.add(key)
+        try:
+            await self._rate_limiter.wait(origin)
+            await session.get(origin, impersonate=profile, timeout=_TIMEOUT_S, allow_redirects=True)
+            log.debug("Warmed %s session for %s", profile, origin)
+        except Exception as exc:  # noqa: BLE001 - warming is best-effort
+            log.debug("Could not warm %s for %s: %s", profile, origin, exc)
+
+    async def _fetch_impersonated(self, url: str, profile: str) -> tuple[str, int, str]:
+        """Fetch using a real browser's TLS fingerprint via curl_cffi."""
+        session = await self._impersonate_session(profile)
+        await self._warm(session, url, profile)
+
+        await self._rate_limiter.wait(url)
+        async with self._semaphore:
+            response = await session.get(
+                url,
+                impersonate=profile,
+                timeout=_TIMEOUT_S,
+                # curl_cffi does not follow redirects by default, unlike the httpx
+                # client above.
+                allow_redirects=True,
+            )
+        content_type = str(response.headers.get("content-type", ""))
+        body = response.text if _is_texty(content_type) else ""
+        return body, int(response.status_code), content_type
 
     async def _fetch_rendered(self, url: str) -> tuple[str, int, str]:
         browser = await self._ensure_browser()
@@ -177,7 +303,9 @@ class Scraper:
             return browser
         return await playwright.chromium.launch(headless=True)
 
-    def _build_result(self, url: str, html: str, status: int, content_type: str) -> FetchResult:
+    def _build_result(
+        self, url: str, html: str, status: int, content_type: str, via: str = "httpx"
+    ) -> FetchResult:
         blocked, reason = _detect_block(status, html)
         if blocked:
             self._rate_limiter.record_block(url)
@@ -201,6 +329,7 @@ class Scraper:
             content_type=content_type,
             blocked=blocked,
             block_reason=reason,
+            via=via,
         )
 
 
@@ -209,6 +338,11 @@ async def _start_playwright() -> Playwright:
     from playwright.async_api import async_playwright
 
     return await async_playwright().start()
+
+
+def _origin_of(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}/"
 
 
 def _validate_url(url: str) -> None:

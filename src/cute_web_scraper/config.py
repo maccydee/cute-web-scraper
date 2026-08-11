@@ -36,6 +36,14 @@ class Config:
     cache_max_entries: int
     """Maximum cached pages before least-recently-used eviction."""
 
+    impersonate: bool = True
+    """Retry a blocked request with real browser TLS fingerprints.
+
+    Some sites fingerprint the TLS handshake rather than reading headers, so no
+    User-Agent change gets past them. Set SCRAPER_IMPERSONATE=0 to disable and
+    let blocks stand.
+    """
+
     db_path: Path = field(default_factory=lambda: Path(_DEFAULT_DB_PATH).expanduser())
     """SQLite file holding saved result tables."""
 
@@ -61,6 +69,7 @@ class Config:
             max_concurrent=max_concurrent,
             auth_token=_str_env("SCRAPER_AUTH_TOKEN"),
             user_data_dir=_str_env("SCRAPER_CHROME_USER_DATA_DIR"),
+            impersonate=_bool_env("SCRAPER_IMPERSONATE", default=True),
             cache_ttl_s=cache_ttl_s,
             cache_max_entries=cache_max_entries,
             db_path=Path(raw_db).expanduser(),
@@ -68,6 +77,13 @@ class Config:
                 "SCRAPER_MAX_INLINE_CHARS", _DEFAULT_MAX_INLINE_CHARS, minimum=1000
             ),
         )
+
+
+def _bool_env(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
 
 
 def _str_env(name: str) -> str | None:

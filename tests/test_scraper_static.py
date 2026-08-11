@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+import httpx
 import pytest
 
 from cute_web_scraper.config import Config
@@ -12,6 +15,10 @@ def _config(**overrides) -> Config:
         user_data_dir=None,
         cache_ttl_s=0,
         cache_max_entries=10,
+        # Off by default here: curl_cffi uses its own HTTP stack, which pytest_httpx
+        # cannot intercept, so leaving it on would let real requests escape the
+        # unit suite. Escalation has its own tests below with the tier mocked.
+        impersonate=False,
     )
     base.update(overrides)
     return Config(**base)
@@ -122,3 +129,216 @@ async def test_cache_hit_skips_second_request(httpx_mock):
     assert first.from_cache is False
     assert second.from_cache is True
     assert len(httpx_mock.get_requests()) == 1
+
+
+# ------------------------------------------------- TLS-fingerprint escalation
+
+
+async def test_no_escalation_when_the_plain_request_succeeds(httpx_mock):
+    """The fast path must stay untouched for the sites that never block."""
+    httpx_mock.add_response(html="<h1>Fine</h1>")
+    calls: list[str] = []
+
+    async def spy(self, url, profile):
+        calls.append(profile)
+        raise AssertionError("should not escalate")
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://example.com")
+    assert result.via == "httpx"
+    assert calls == []
+
+
+async def test_block_escalates_and_first_profile_clears_it(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+    tried: list[str] = []
+
+    async def spy(self, url, profile):
+        tried.append(profile)
+        return "<h1>Products</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://blocked.example")
+    assert result.blocked is False
+    assert result.via == "impersonate:chrome131"
+    assert "# Products" in result.markdown
+    assert tried == ["chrome131"]
+
+
+async def test_falls_through_to_the_second_profile(httpx_mock):
+    """eBay rejects the Chrome fingerprint but accepts Safari's."""
+    httpx_mock.add_response(status_code=403)
+    tried: list[str] = []
+
+    async def spy(self, url, profile):
+        tried.append(profile)
+        if profile == "chrome131":
+            return "", 403, "text/html"
+        return "<h1>Listings</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://ebay.example")
+    assert result.blocked is False
+    assert result.via == "impersonate:safari17_0"
+    assert tried == ["chrome131", "safari17_0"]
+
+
+async def test_still_blocked_after_every_profile(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+
+    async def spy(self, url, profile):
+        return "", 403, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://hopeless.example")
+    assert result.blocked is True
+    assert result.block_reason == "http_403"
+    assert result.via == "impersonate:exhausted"
+
+
+async def test_a_failing_profile_does_not_abort_the_escalation(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+
+    async def spy(self, url, profile):
+        if profile == "chrome131":
+            raise RuntimeError("curl exploded")
+        return "<h1>Recovered</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://flaky.example")
+    assert result.via == "impersonate:safari17_0"
+
+
+async def test_escalation_can_be_switched_off(httpx_mock):
+    httpx_mock.add_response(status_code=403)
+
+    async def spy(self, url, profile):
+        raise AssertionError("must not escalate when disabled")
+
+    async with Scraper(_config(impersonate=False)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://blocked.example")
+    assert result.blocked is True
+    assert result.via == "httpx"
+
+
+async def test_cleared_block_does_not_penalise_the_domain(httpx_mock):
+    """If escalation worked, the domain isn't hostile — don't widen its delay."""
+    httpx_mock.add_response(status_code=403)
+
+    async def spy(self, url, profile):
+        return "<h1>ok</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True, delay_ms=100)) as s:
+        before = s.rate_limiter.current_delay("https://blocked.example")
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            await s.fetch("https://blocked.example")
+        after = s.rate_limiter.current_delay("https://blocked.example")
+    assert after <= before
+
+
+async def test_transport_error_also_escalates(httpx_mock):
+    """ASOS drops the connection rather than answering 403 — that must escalate too."""
+    httpx_mock.add_exception(httpx.ReadError(""))
+
+    async def spy(self, url, profile):
+        return "<h1>Products</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://asos.example")
+    assert result.blocked is False
+    assert result.via == "impersonate:chrome131"
+    assert "# Products" in result.markdown
+
+
+async def test_transport_error_with_no_rescue_raises(httpx_mock):
+    """An empty body with status 0 would read as a blank page; raise instead."""
+    httpx_mock.add_exception(httpx.ReadError("boom"))
+
+    async def spy(self, url, profile):
+        raise RuntimeError("also failed")
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            with pytest.raises(httpx.ReadError):
+                await s.fetch("https://asos.example")
+
+
+async def test_transport_error_propagates_when_escalation_is_off(httpx_mock):
+    httpx_mock.add_exception(httpx.ReadError("boom"))
+    async with Scraper(_config(impersonate=False)) as s:
+        with pytest.raises(httpx.ReadError):
+            await s.fetch("https://asos.example")
+
+
+async def test_impersonated_fetch_follows_redirects():
+    """curl_cffi does not follow redirects by default; without this eBay came back
+    as a 13KB stub instead of the 2.1MB results page."""
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "<h1>ok</h1>"
+        headers = {"content-type": "text/html"}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    import curl_cffi.requests
+
+    async with Scraper(_config()) as s:
+        with patch.object(curl_cffi.requests, "AsyncSession", FakeSession):
+            await s._fetch_impersonated("https://example.com", "chrome131")
+
+    assert captured.get("allow_redirects") is True
+    assert captured.get("impersonate") == "chrome131"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<title>Pardon our interruption...</title>",
+        "<p>Checking your browser before you access eBay.</p>",
+    ],
+)
+async def test_interstitial_served_with_200_is_a_block(httpx_mock, body):
+    """eBay returns its Akamai interstitial with HTTP 200. Status alone misses it,
+    and accepting it would return a 13KB stub as though it were the page."""
+    httpx_mock.add_response(status_code=200, html=body)
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://ebay.example")
+    assert result.blocked is True
+    assert result.block_reason == "challenge"
+
+
+async def test_interstitial_keeps_the_escalation_going(httpx_mock):
+    """A 200 interstitial from one profile must not end the search early."""
+    httpx_mock.add_response(status_code=403)
+    tried: list[str] = []
+
+    async def spy(self, url, profile):
+        tried.append(profile)
+        if profile == "chrome131":
+            return "<title>Pardon our interruption...</title>", 200, "text/html"
+        return "<h1>Listings</h1>", 200, "text/html"
+
+    async with Scraper(_config(impersonate=True)) as s:
+        with patch.object(Scraper, "_fetch_impersonated", new=spy):
+            result = await s.fetch("https://ebay.example")
+    assert tried == ["chrome131", "safari17_0"]
+    assert result.via == "impersonate:safari17_0"
+    assert result.blocked is False
