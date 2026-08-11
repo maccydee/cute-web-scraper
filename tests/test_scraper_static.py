@@ -83,6 +83,37 @@ async def test_invalid_scheme():
             await s.fetch("ftp://example.com")
 
 
+async def test_fetch_consults_the_rate_limiter(httpx_mock):
+    """Proves the limiter is wired into fetch, without depending on wall clock.
+
+    A live timing test cannot establish this: the limiter is start-to-start, so when a
+    host is slower than the configured delay the network time absorbs the interval and
+    the elapsed time is the same with or without the limiter.
+    """
+    httpx_mock.add_response(html="<h1>Hi</h1>")
+    async with Scraper(_config()) as s:
+        waited: list[str] = []
+        original = s.rate_limiter.wait
+
+        async def spy(url: str) -> None:
+            waited.append(url)
+            await original(url)
+
+        s.rate_limiter.wait = spy  # type: ignore[method-assign]
+        await s.fetch("https://example.com/page")
+
+    assert waited == ["https://example.com/page"]
+
+
+async def test_fetch_records_success_with_the_rate_limiter(httpx_mock):
+    httpx_mock.add_response(status_code=429)
+    async with Scraper(_config(delay_ms=100)) as s:
+        before = s.rate_limiter.current_delay("https://example.com")
+        await s.fetch("https://example.com")
+        after = s.rate_limiter.current_delay("https://example.com")
+    assert after > before, "a blocked fetch must widen the domain's delay"
+
+
 async def test_cache_hit_skips_second_request(httpx_mock):
     httpx_mock.add_response(html="<h1>Once</h1>")
     async with Scraper(_config(cache_ttl_s=60)) as s:

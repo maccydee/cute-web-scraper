@@ -67,35 +67,42 @@ async def test_crawl_discovers_pages(scraper):
     print(f"\ndiscovered {len(urls)} urls via {source}, first: {urls[0]}")
 
 
-async def test_rate_limiter_enforces_rate(scraper):
-    """The limiter caps the request rate per domain, measured start-to-start.
+async def test_rate_limiter_spaces_same_domain_requests(scraper):
+    """Back-to-back limiter calls on one domain are spaced by the configured delay.
 
-    Timed from the start of the first fetch to the start of the second, which is the
-    semantic the limiter actually implements: one request per delay_ms per domain,
-    with a slow response counting toward the interval rather than adding to it.
+    Timed around rate_limiter.wait() rather than two fetches. The limiter is
+    start-to-start, so when a host answers in ~3.5s and the delay is 500ms the network
+    time absorbs the interval entirely: two fetches take about the same wall clock
+    whether the limiter runs or not, which makes a fetch-timed assertion unfalsifiable.
+    Wiring into Scraper.fetch is covered deterministically in tests/test_scraper_static.py.
     """
     start = time.monotonic()
-    await scraper.fetch(BASE)
-    await scraper.fetch(SECOND)
-    elapsed = time.monotonic() - start  # (MEASURED, seconds)
+    await scraper.rate_limiter.wait(BASE)
+    await scraper.rate_limiter.wait(SECOND)  # same domain as BASE
+    elapsed = time.monotonic() - start  # (MEASURED, seconds) limiter only
     minimum = DELAY_MS / 1000 * 0.9
     assert elapsed >= minimum, (
-        f"two same-domain fetches took {elapsed:.2f}s, below the {DELAY_MS}ms rate. "
-        "The limiter is not being applied in Scraper.fetch."
+        f"two same-domain limiter calls took {elapsed:.2f}s, below the {DELAY_MS}ms rate"
     )
-    print(f"\ntwo same-domain fetches took {elapsed:.2f}s (rate floor {minimum:.2f}s)")
+    print(f"\nlimiter spaced two same-domain calls by {elapsed:.2f}s (floor {minimum:.2f}s)")
 
 
 async def test_different_domains_are_not_penalised(scraper):
-    """A second domain is not made to wait behind the first."""
+    """A fresh domain incurs no waiting from the limiter.
+
+    Timed around rate_limiter.wait() rather than a whole fetch. A fetch also includes
+    network latency, and these hosts answer a cold request in ~3.5s, which has nothing
+    to do with the limiter — timing the fetch would be asserting the network is fast.
+    """
     await scraper.fetch(BASE)
     start = time.monotonic()
-    await scraper.fetch("https://quotes.toscrape.com/")
-    elapsed = time.monotonic() - start  # (MEASURED, seconds)
-    assert elapsed < DELAY_MS / 1000, (
-        f"a different domain waited {elapsed:.2f}s; the delay should be per-domain"
+    await scraper.rate_limiter.wait("https://quotes.toscrape.com/")
+    limiter_delay = time.monotonic() - start  # (MEASURED, seconds) limiter only
+    assert limiter_delay < 0.1, (
+        f"the limiter made a fresh domain wait {limiter_delay:.2f}s; "
+        "the delay is supposed to be per-domain"
     )
-    print(f"\ndifferent-domain fetch took {elapsed:.2f}s (no cross-domain penalty)")
+    print(f"\nlimiter contributed {limiter_delay:.3f}s for a fresh domain")
 
 
 async def test_js_render_path(scraper):
