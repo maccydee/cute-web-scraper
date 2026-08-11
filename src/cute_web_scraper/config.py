@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 _DEFAULT_DELAY_MS = 1000
 _DEFAULT_MAX_CONCURRENT = 5
 _DEFAULT_CACHE_TTL_S = 300
 _DEFAULT_CACHE_MAX_ENTRIES = 500
+_DEFAULT_MAX_INLINE_CHARS = 50_000
+_DEFAULT_DB_PATH = "~/.cute-web-scraper/results.db"
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,17 @@ class Config:
     cache_max_entries: int
     """Maximum cached pages before least-recently-used eviction."""
 
+    db_path: Path = field(default_factory=lambda: Path(_DEFAULT_DB_PATH).expanduser())
+    """SQLite file holding saved result tables."""
+
+    max_inline_chars: int = _DEFAULT_MAX_INLINE_CHARS
+    """Ceiling on how much text a single tool may return inline.
+
+    Past this, a tool truncates and tells the caller to save to a table and query it
+    instead. Without a ceiling, one fetch_pages call over a large URL list can fill
+    the whole conversation.
+    """
+
     @classmethod
     def from_env(cls) -> Config:
         delay_ms = _int_env("SCRAPER_DELAY_MS", _DEFAULT_DELAY_MS, minimum=0)
@@ -41,6 +55,7 @@ class Config:
         cache_max_entries = _int_env(
             "SCRAPER_CACHE_MAX_ENTRIES", _DEFAULT_CACHE_MAX_ENTRIES, minimum=1
         )
+        raw_db = _str_env("SCRAPER_DB_PATH") or _DEFAULT_DB_PATH
         return cls(
             delay_ms=delay_ms,
             max_concurrent=max_concurrent,
@@ -48,6 +63,10 @@ class Config:
             user_data_dir=_str_env("SCRAPER_CHROME_USER_DATA_DIR"),
             cache_ttl_s=cache_ttl_s,
             cache_max_entries=cache_max_entries,
+            db_path=Path(raw_db).expanduser(),
+            max_inline_chars=_int_env(
+                "SCRAPER_MAX_INLINE_CHARS", _DEFAULT_MAX_INLINE_CHARS, minimum=1000
+            ),
         )
 
 

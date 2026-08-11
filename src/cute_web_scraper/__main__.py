@@ -54,12 +54,15 @@ async def running_server() -> AsyncIterator[tuple[MCPServer, Config]]:
     from .config import Config
     from .scraper import Scraper
     from .server import ScraperHolder, create_server
+    from .store import ResultStore
 
     config = Config.from_env()
+    store = ResultStore(config.db_path)
     holder = ScraperHolder()
     mcp = create_server(holder)
+    log.info("result tables at %s", store.path)
     async with Scraper(config) as scraper:
-        holder.set(scraper)
+        holder.set(scraper, store=store, config=config)
         yield mcp, config
 
 

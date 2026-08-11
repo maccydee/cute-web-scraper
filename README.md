@@ -30,27 +30,76 @@ Scrape every product from https://example-shop.com and give me a CSV of name and
 
 ## Tools
 
+**Fetching and discovery**
+
 | Tool | What it does |
 |---|---|
 | `fetch_page` | One URL to clean markdown, with title, status and link count |
 | `fetch_pages` | Many URLs in parallel, returning results and per-URL errors |
 | `crawl_site` | Discover a site's pages via sitemap, falling back to link-following |
 | `analyze_website` | Detect the platform, find the sitemap, report whether JS is needed |
+
+**Extraction**
+
+| Tool | What it does |
+|---|---|
+| `extract_products` | Structured product data (name, price, currency, availability, brand, sku, rating) from JSON-LD, OpenGraph or microdata |
 | `extract_emails` | Email addresses across a list of URLs, with surrounding context |
 | `extract_phones` | Phone numbers across a list of URLs, with surrounding context |
 | `extract_links` | Every hyperlink, resolved to absolute URLs |
 | `extract_social_links` | Social profiles across eight platforms |
+| `extract_shopify_store` | A whole Shopify catalogue, one row per variant |
+| `list_shopify_collections` | A Shopify store's collections and their product counts |
 
-A typical run composes them: `analyze_website` → `crawl_site` → `fetch_pages`.
+**Result tables**
+
+| Tool | What it does |
+|---|---|
+| `list_tables` | Saved result tables with row counts and columns |
+| `get_table` | One table's columns, row count and a sample |
+| `query_table` | Read-only SQL over a saved table — filter, aggregate, group, sort |
+| `export_table` | Write a table to CSV or JSON on disk |
+| `drop_table` | Delete a saved table |
+
+A typical run composes them: `analyze_website` → `crawl_site` → `fetch_pages` → `query_table`.
+
+### Slash commands
+
+The server ships four ready-made workflows, which appear as slash commands in Claude Code: `scrape_site`, `scrape_shopify_store`, `find_contacts` and `compare_prices`.
+
+## Working with large scrapes
+
+Any tool that returns rows accepts `save_as`. Instead of putting the data in the conversation, it writes a result table and hands back a summary:
+
+```
+Extract the whole catalogue from deathwishcoffee.com into a table called `catalogue`,
+then tell me the price range and how many variants are out of stock.
+```
+
+Claude calls `extract_shopify_store(save_as="catalogue")`, gets back a row count and column list, and then answers with `query_table`:
+
+```sql
+SELECT COUNT(*) AS variants, MIN(price) AS cheapest,
+       MAX(price) AS dearest, SUM(available) AS in_stock
+FROM catalogue
+```
+
+The table can hold 100,000 rows and none of them enter the conversation. `query_table` is strictly read-only — it runs against a read-only SQLite handle and rejects anything that is not a `SELECT`, so a query can never modify or delete saved data.
+
+Tables live in a SQLite file at `~/.cute-web-scraper/results.db` (set `SCRAPER_DB_PATH` to move it).
+
+Tool output is also capped at `SCRAPER_MAX_INLINE_CHARS` (50,000 by default). Past that, a result is truncated with a note pointing at `save_as` — so a single call can't fill your context by accident.
 
 ## Example prompts
 
 ```
-Scrape every product from https://example-shop.com and give me a CSV of name and price.
+Export the whole catalogue from deathwishcoffee.com and tell me the price range.
 
 Find all email addresses on https://company.com and its contact pages.
 
 What platform is https://myblog.com on? Does it need JavaScript to scrape?
+
+Scrape these 200 product pages into a table, then show me everything under £50 that's in stock.
 
 Extract the social media links from these 10 agency sites: [urls...]
 ```
@@ -67,6 +116,8 @@ Everything is an environment variable, with defaults that work unconfigured.
 | `SCRAPER_CACHE_MAX_ENTRIES` | `500` | Cached pages before least-recently-used eviction |
 | `SCRAPER_AUTH_TOKEN` | unset | Bearer token for HTTP mode |
 | `SCRAPER_CHROME_USER_DATA_DIR` | unset | Chrome profile to inherit logged-in sessions from |
+| `SCRAPER_DB_PATH` | `~/.cute-web-scraper/results.db` | Where result tables are stored |
+| `SCRAPER_MAX_INLINE_CHARS` | `50000` | Ceiling on how much a single tool returns inline |
 
 ## How it behaves
 
