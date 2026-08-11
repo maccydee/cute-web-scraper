@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 ExtractorFn = Callable[[str, str], list[dict[str, str]]]
 
-_DEFAULT_MAX_INLINE_CHARS = 50_000
+_DEFAULT_MAX_INLINE_CHARS = 25_000
 
 
 class ScraperHolder:
@@ -105,14 +105,13 @@ def _register_place_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             places = await search_places(query, scraper.http, limit=limit)
         except PlacesError as exc:
             return json.dumps({"query": query, "error": _describe(exc), "results": []})
-        if save_as:
-            return _save_and_summarise(holder, save_as, places, [])
-        return _truncate(
-            json.dumps(
-                {"query": query, "count": len(places), "results": places}, ensure_ascii=False
-            ),
-            holder.max_inline_chars,
-            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        return _emit_rows(
+            holder,
+            "find_places",
+            {"query": query, "count": len(places), "results": places},
+            places,
+            [],
+            save_as,
         )
 
     @mcp.tool(
@@ -147,25 +146,21 @@ def _register_place_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             )
 
         named = [p for p in places if p.get("name")]
-        if save_as and named:
-            summary = json.loads(_save_and_summarise(holder, save_as, named, []))
-            summary["centre"] = label
-            summary["radius_m"] = radius_m
-            return json.dumps(summary, ensure_ascii=False)
-        return _truncate(
-            json.dumps(
-                {
-                    "category": category,
-                    "centre": label,
-                    "radius_m": radius_m,
-                    "count": len(named),
-                    "results": named,
-                },
-                ensure_ascii=False,
-            ),
-            holder.max_inline_chars,
-            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        emitted = _emit_rows(
+            holder,
+            "find_places_nearby",
+            {
+                "category": category,
+                "centre": label,
+                "radius_m": radius_m,
+                "count": len(named),
+                "results": named,
+            },
+            named,
+            [],
+            save_as,
         )
+        return _with_extras(emitted, {"centre": label, "radius_m": radius_m})
 
 
 # --------------------------------------------------------------------------- fetch
@@ -186,7 +181,35 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller as text
             log.error("tool=fetch_page failed: %s", exc)
             return f"Error fetching {url}: {_describe(exc)}"
-        return _truncate(_render_page(result), holder.max_inline_chars)
+
+        rendered = _render_page(result)
+        if len(rendered) <= holder.max_inline_chars or result.blocked:
+            return rendered
+        # Keep the whole page rather than lopping off its tail: save it and hand
+        # back the head plus a pointer to the rest.
+        table = _auto_table_name(holder, "fetch_page")
+        try:
+            holder.require_store().save(
+                table,
+                [
+                    {
+                        "url": result.url,
+                        "title": result.title,
+                        "status_code": result.status_code,
+                        "links_count": result.links_count,
+                        "markdown": result.markdown,
+                    }
+                ],
+            )
+        except StoreError:
+            return _truncate(rendered, holder.max_inline_chars)
+        return (
+            rendered[: holder.max_inline_chars]
+            + f"\n\n[This page is {len(rendered)} chars, over the "
+            f"{holder.max_inline_chars}-char inline limit. The full text was saved to "
+            f"table '{table}' — nothing was lost. Read the rest with: "
+            f"SELECT markdown FROM {table}]"
+        )
 
     @mcp.tool(
         description=(
@@ -212,12 +235,8 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             }
             for r in results
         ]
-        if save_as:
-            return _save_and_summarise(holder, save_as, rows, errors)
-        return _truncate(
-            json.dumps({"results": rows, "errors": errors}, ensure_ascii=False),
-            holder.max_inline_chars,
-            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        return _emit_rows(
+            holder, "fetch_pages", {"results": rows, "errors": errors}, rows, errors, save_as
         )
 
 
@@ -327,10 +346,14 @@ def _register_extract_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
     ]
     shared = " Pass save_as='<table_name>' to store results instead of returning them inline."
     for name, fn, description in specs:
-        mcp.add_tool(_build_extract_tool(holder, fn), name=name, description=description + shared)
+        mcp.add_tool(
+            _build_extract_tool(holder, fn, name), name=name, description=description + shared
+        )
 
 
-def _build_extract_tool(holder: ScraperHolder, extractor: ExtractorFn) -> Callable[..., Any]:
+def _build_extract_tool(
+    holder: ScraperHolder, extractor: ExtractorFn, tool_name: str
+) -> Callable[..., Any]:
     # A plain closure registered via add_tool. functools.wraps would copy the
     # extractor's __annotations__/__wrapped__ onto this function and publish a
     # wrong tool schema.
@@ -342,12 +365,8 @@ def _build_extract_tool(holder: ScraperHolder, extractor: ExtractorFn) -> Callab
             # Raw HTML, never markdown. Link and social extraction parse <a href>
             # tags, which markdown does not contain.
             results.extend(extractor(page.html, page.url))
-        if save_as:
-            return _save_and_summarise(holder, save_as, results, errors)
-        return _truncate(
-            json.dumps({"results": results, "errors": errors}, ensure_ascii=False),
-            holder.max_inline_chars,
-            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        return _emit_rows(
+            holder, tool_name, {"results": results, "errors": errors}, results, errors, save_as
         )
 
     return _extract
@@ -373,12 +392,8 @@ def _register_product_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
                 errors.append(
                     {"url": str(row["url"]), "error": "no structured product data on this page"}
                 )
-        if save_as:
-            return _save_and_summarise(holder, save_as, found, errors)
-        return _truncate(
-            json.dumps({"results": found, "errors": errors}, ensure_ascii=False),
-            holder.max_inline_chars,
-            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        return _emit_rows(
+            holder, "extract_products", {"results": found, "errors": errors}, found, errors, save_as
         )
 
 
@@ -426,24 +441,20 @@ def _register_shopify_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         rows = variant_rows(products, store_url)
         if not rows:
             return json.dumps({"store_url": store_url, "products": 0, "variants": 0, "results": []})
-        if save_as:
-            summary = json.loads(_save_and_summarise(holder, save_as, rows, []))
-            summary["products"] = len(products)
-            summary["variants"] = len(rows)
-            return json.dumps(summary, ensure_ascii=False)
-        return _truncate(
-            json.dumps(
-                {
-                    "store_url": store_url,
-                    "products": len(products),
-                    "variants": len(rows),
-                    "results": rows,
-                },
-                ensure_ascii=False,
-            ),
-            holder.max_inline_chars,
-            hint="Re-run with save_as='<table_name>' and query it with query_table.",
+        emitted = _emit_rows(
+            holder,
+            "extract_shopify_store",
+            {
+                "store_url": store_url,
+                "products": len(products),
+                "variants": len(rows),
+                "results": rows,
+            },
+            rows,
+            [],
+            save_as,
         )
+        return _with_extras(emitted, {"products": len(products), "variants": len(rows)})
 
 
 # -------------------------------------------------------------------------- tables
@@ -729,6 +740,64 @@ def _truncate(payload: str, max_chars: int, hint: str = "") -> str:
         suffix += f" {hint}"
     suffix += "]"
     return payload[:max_chars] + suffix
+
+
+def _with_extras(emitted: str, extras: dict[str, Any]) -> str:
+    """Re-attach tool-specific fields to whatever shape _emit_rows chose."""
+    try:
+        payload = json.loads(emitted)
+    except json.JSONDecodeError:
+        return emitted
+    if not isinstance(payload, dict):
+        return emitted
+    payload.update(extras)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _auto_table_name(holder: ScraperHolder, tool: str) -> str:
+    """Pick an unused `auto_<tool>` name, suffixing a number if needed."""
+    existing = {t.name for t in holder.require_store().list_tables()}
+    base = f"auto_{tool}"
+    if base not in existing:
+        return base
+    index = 2
+    while f"{base}_{index}" in existing:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _emit_rows(
+    holder: ScraperHolder,
+    tool: str,
+    payload: dict[str, Any],
+    rows: list[dict[str, Any]],
+    errors: list[dict[str, str]],
+    save_as: str,
+) -> str:
+    """Return rows inline when small, otherwise save them to a table.
+
+    The rows have already been fetched by the time we get here, so truncating and
+    telling the caller to re-run means throwing away a completed scrape and paying
+    for it twice. Overflowing into a table instead keeps every row and costs one
+    query to get at them.
+    """
+    if save_as:
+        return _save_and_summarise(holder, save_as, rows, errors)
+
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) <= holder.max_inline_chars:
+        return text
+    if not rows:
+        return _truncate(text, holder.max_inline_chars)
+
+    table = _auto_table_name(holder, tool)
+    summary = json.loads(_save_and_summarise(holder, table, rows, errors))
+    summary["note"] = (
+        f"The result was {len(text)} chars, over the {holder.max_inline_chars}-char "
+        f"inline limit, so all {len(rows)} rows were saved to '{table}' instead of "
+        "being truncated. Nothing was lost — query it with query_table."
+    )
+    return json.dumps(summary, ensure_ascii=False)
 
 
 def _render_page(result: FetchResult) -> str:

@@ -146,29 +146,56 @@ async def test_save_as_with_no_usable_rows(mcp, holder):
     assert payload["errors"][0]["error"] == "RuntimeError: down"
 
 
-# -------------------------------------------------------------- truncation guard
+# ------------------------------------------------------- overflow: save, not lose
 
 
-async def test_fetch_pages_inline_output_is_capped(mcp, holder):
-    """One call must not be able to fill the conversation."""
-    huge = _page(markdown="x" * 5000)
-    holder.set(AsyncMock(fetch=AsyncMock(return_value=huge)))
+async def test_oversized_batch_is_saved_rather_than_discarded(mcp, holder):
+    """The rows are already fetched, so truncating would waste a completed scrape."""
+    holder.set(AsyncMock(fetch=AsyncMock(return_value=_page(markdown="x" * 5000))))
+    payload = await _json(mcp, "fetch_pages", {"urls": [f"https://a.com/{i}" for i in range(20)]})
+    assert payload["saved_to"] == "auto_fetch_pages"
+    assert payload["row_count"] == 20  # every row kept, none truncated away
+    assert "note" in payload
+    assert holder.require_store().get_table("auto_fetch_pages").row_count == 20
+
+
+async def test_oversized_batch_summary_stays_small(mcp, holder):
+    holder.set(AsyncMock(fetch=AsyncMock(return_value=_page(markdown="x" * 5000))))
     text = await _text(mcp, "fetch_pages", {"urls": [f"https://a.com/{i}" for i in range(20)]})
-    assert len(text) < 3000
-    assert "truncated" in text
-    assert "save_as" in text
+    assert len(text) < 3000, "the summary must not itself flood the conversation"
 
 
-async def test_fetch_page_inline_output_is_capped(mcp, holder):
+async def test_auto_table_names_do_not_collide(mcp, holder):
+    holder.set(AsyncMock(fetch=AsyncMock(return_value=_page(markdown="x" * 5000))))
+    urls = [f"https://a.com/{i}" for i in range(20)]
+    first = await _json(mcp, "fetch_pages", {"urls": urls})
+    second = await _json(mcp, "fetch_pages", {"urls": urls})
+    assert first["saved_to"] == "auto_fetch_pages"
+    assert second["saved_to"] == "auto_fetch_pages_2"
+
+
+async def test_oversized_single_page_keeps_its_full_text(mcp, holder):
     holder.set(AsyncMock(fetch=AsyncMock(return_value=_page(markdown="y" * 10_000))))
     text = await _text(mcp, "fetch_page", {"url": "https://a.com"})
     assert len(text) < 3000
-    assert "truncated" in text
+    assert "auto_fetch_page" in text
+    stored = holder.require_store().query("SELECT LENGTH(markdown) AS n FROM auto_fetch_page")
+    assert stored.rows[0]["n"] == 10_000  # nothing lopped off
 
 
-async def test_small_output_is_not_truncated(mcp):
+async def test_blocked_page_is_not_saved(mcp, holder):
+    """A block has no content worth storing."""
+    holder.set(
+        AsyncMock(fetch=AsyncMock(return_value=_page(blocked=True, block_reason="http_403")))
+    )
     text = await _text(mcp, "fetch_page", {"url": "https://a.com"})
-    assert "truncated" not in text
+    assert "http_403" in text
+    assert holder.require_store().list_tables() == []
+
+
+async def test_small_output_is_returned_inline(mcp):
+    text = await _text(mcp, "fetch_page", {"url": "https://a.com"})
+    assert "auto_fetch_page" not in text
     assert "# Widget" in text
 
 
