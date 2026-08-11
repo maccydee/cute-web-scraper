@@ -124,14 +124,41 @@ class Scraper:
             return replace(cached, from_cache=True)
 
         if js_render:
-            html, status, content_type = await self._fetch_rendered(url)
-            via = "playwright"
+            html, status, content_type, via = await self._fetch_rendered_with_fallback(url)
         else:
             html, status, content_type, via = await self._fetch_static_escalating(url)
 
         result = self._build_result(url, html, status, content_type, via)
         self._cache.put(url, js_render, result)
         return result
+
+    async def _fetch_rendered_with_fallback(self, url: str) -> tuple[str, int, str, str]:
+        """Render in a browser, but fall back to TLS impersonation if that is blocked.
+
+        Playwright and curl_cffi fail in opposite directions. Playwright runs
+        JavaScript but is a *detectably automated* browser, so ASOS answers it with
+        403 while letting curl_cffi straight through. Without this fallback, asking
+        for js_render on ASOS returned 296 bytes where the default returned 613KB —
+        requesting more capability got you less.
+        """
+        try:
+            html, status, content_type = await self._fetch_rendered(url)
+        except Exception as exc:  # noqa: BLE001
+            if not self._config.impersonate:
+                raise
+            log.info("Rendering failed for %s (%s); falling back", url, type(exc).__name__)
+            return await self._fetch_static_escalating(url)
+
+        blocked, _ = _detect_block(status, html)
+        if not blocked or not self._config.impersonate:
+            return html, status, content_type, "playwright"
+
+        log.info("The browser was blocked on %s; falling back to TLS impersonation", url)
+        fallback = await self._fetch_static_escalating(url)
+        if not _detect_block(fallback[1], fallback[0])[0]:
+            return fallback
+        # Both routes blocked: keep the browser's answer, which is the fuller attempt.
+        return html, status, content_type, "playwright"
 
     async def _fetch_static_escalating(self, url: str) -> tuple[str, int, str, str]:
         """Plain request first; on a block, retry with browser TLS fingerprints.
