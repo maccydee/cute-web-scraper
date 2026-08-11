@@ -25,7 +25,13 @@ class _DomainState:
 
 
 class DomainRateLimiter:
-    """Serialises requests per domain and widens the gap when a domain pushes back."""
+    """Serialises requests per domain and widens the gap when a domain pushes back.
+
+    The delay is measured start-to-start, so it caps the *rate* at one request per
+    `delay_ms` per domain. A slow response therefore counts toward the interval
+    rather than being added on top of it: a 400ms response under a 500ms delay
+    waits a further 100ms, not another 500ms.
+    """
 
     def __init__(self, config: Config, *, max_domains: int = _DEFAULT_MAX_DOMAINS) -> None:
         self._base_s = config.delay_ms / 1000
