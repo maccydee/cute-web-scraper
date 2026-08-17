@@ -266,3 +266,40 @@ async def test_drop_table(mcp, holder):
     payload = await _json(mcp, "drop_table", {"name": "t"})
     assert payload["rows_deleted"] == 2
     assert holder.require_store().list_tables() == []
+
+
+# ------------------------------------------------------------- append vs replace
+
+
+async def test_batches_replace_by_default(mcp, holder):
+    """The old behaviour, made explicit: each save drops the previous table."""
+    await _json(mcp, "fetch_pages", {"urls": ["https://a.com"], "save_as": "pages"})
+    await _json(mcp, "fetch_pages", {"urls": ["https://b.com"], "save_as": "pages"})
+    assert holder.require_store().get_table("pages").row_count == 1
+
+
+async def test_append_mode_accumulates_batches(mcp, holder):
+    """Found by review: feeding a long URL list through in batches silently kept
+    only the last batch, because every save dropped the table first."""
+    await _json(mcp, "fetch_pages", {"urls": ["https://a.com"], "save_as": "pages"})
+    payload = await _json(
+        mcp, "fetch_pages", {"urls": ["https://b.com"], "save_as": "pages", "mode": "append"}
+    )
+    assert payload["mode"] == "append"
+    assert holder.require_store().get_table("pages").row_count == 2
+
+
+async def test_append_creates_the_table_when_absent(mcp, holder):
+    payload = await _json(
+        mcp, "fetch_pages", {"urls": ["https://a.com"], "save_as": "fresh", "mode": "append"}
+    )
+    assert payload["row_count"] == 1
+
+
+async def test_extract_tools_support_append(mcp, holder):
+    await _json(mcp, "extract_links", {"urls": ["https://a.com"], "save_as": "links"})
+    before = holder.require_store().get_table("links").row_count
+    await _json(
+        mcp, "extract_links", {"urls": ["https://b.com"], "save_as": "links", "mode": "append"}
+    )
+    assert holder.require_store().get_table("links").row_count == before * 2

@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 from .cache import PageCache
 from .config import Config
-from .converter import html_to_markdown, page_title
+from .converter import html_to_markdown
 from .rate_limiter import DomainRateLimiter
 
 if TYPE_CHECKING:  # playwright is heavy; keep it out of module import
@@ -32,14 +32,26 @@ _CONTENT_MIN_LINKS = 10
 block observed was under 2KB (ASOS 296 bytes, eBay 1,832, Trustpilot 991), so these
 thresholds sit well clear of them."""
 
-_STEALTH_SETTLE_MS = 4000
-"""How long a stealth render waits for client-side content to populate."""
+_RENDER_SETTLE_MS = 1500
+"""How long a render waits after load for client-side content to populate.
 
-_IMPERSONATE_PROFILES = ("chrome131", "safari17_0")
+`page.goto` returns on the `load` event, which fires before a single-page app has
+fetched and painted anything. Reading content() straight after it is a race that
+returns the empty shell — the exact case js_render exists for.
+"""
+
+_STEALTH_SETTLE_MS = 4000
+"""The stealth tier waits longer: it is the last resort, on the hardest sites."""
+
+_IMPERSONATE_PROFILES = ("chrome", "safari")
 """Tried in order when a plain request is blocked.
 
 Not one magic value: ASOS clears with the Chrome fingerprint while eBay rejects
 Chrome and accepts Safari, so the fallback has to try more than one.
+
+Unversioned aliases on purpose. curl_cffi resolves these to its newest profile,
+whereas a pinned version drifts out of date and a stale browser build is itself
+a detection signal.
 """
 
 _CHALLENGE_SIGNATURES = (
@@ -144,22 +156,36 @@ class Scraper:
     def rate_limiter(self) -> DomainRateLimiter:
         return self._rate_limiter
 
-    async def fetch(self, url: str, *, js_render: bool = False) -> FetchResult:
+    async def fetch(
+        self,
+        url: str,
+        *,
+        js_render: bool = False,
+        wait_ms: int | None = None,
+        wait_for: str = "",
+    ) -> FetchResult:
         _validate_url(url)
-        cached = self._cache.get(url, js_render)
+        # A tuned wait means the caller wants a fresh render, not a cached one.
+        use_cache = wait_ms is None and not wait_for
+        cached = self._cache.get(url, js_render) if use_cache else None
         if cached is not None:
             return replace(cached, from_cache=True)
 
         if js_render:
-            html, status, content_type, via = await self._fetch_rendered_with_fallback(url)
+            html, status, content_type, via = await self._fetch_rendered_with_fallback(
+                url, wait_ms=wait_ms, wait_for=wait_for
+            )
         else:
             html, status, content_type, via = await self._fetch_static_escalating(url)
 
         result = self._build_result(url, html, status, content_type, via)
-        self._cache.put(url, js_render, result)
+        if use_cache:
+            self._cache.put(url, js_render, result)
         return result
 
-    async def _fetch_rendered_with_fallback(self, url: str) -> tuple[str, int, str, str]:
+    async def _fetch_rendered_with_fallback(
+        self, url: str, *, wait_ms: int | None = None, wait_for: str = ""
+    ) -> tuple[str, int, str, str]:
         """Render in a browser, but fall back to TLS impersonation if that is blocked.
 
         Playwright and curl_cffi fail in opposite directions. Playwright runs
@@ -169,7 +195,9 @@ class Scraper:
         requesting more capability got you less.
         """
         try:
-            html, status, content_type = await self._fetch_rendered(url)
+            html, status, content_type = await self._fetch_rendered(
+                url, wait_ms=wait_ms, wait_for=wait_for
+            )
         except Exception as exc:  # noqa: BLE001
             if not self._config.impersonate:
                 raise
@@ -347,7 +375,7 @@ class Scraper:
             self._stealth_browser = browser
             return self._stealth_browser
 
-    async def _fetch_stealth(self, url: str) -> tuple[str, int, str]:
+    async def _fetch_stealth(self, url: str, *, wait_for: str = "") -> tuple[str, int, str]:
         browser = await self._ensure_stealth_browser()
         await self._rate_limiter.wait(url)
         async with self._semaphore:
@@ -361,16 +389,18 @@ class Scraper:
                 content_type = (
                     response.headers.get("content-type", "") if response is not None else ""
                 )
-                # Client-rendered pages need a beat after navigation to populate.
-                await page.wait_for_timeout(_STEALTH_SETTLE_MS)
+                await self._settle(page, _STEALTH_SETTLE_MS, wait_for)
                 html = await page.content()
             finally:
                 await context.close()
         return html, status, content_type
 
-    async def _fetch_rendered(self, url: str) -> tuple[str, int, str]:
+    async def _fetch_rendered(
+        self, url: str, *, wait_ms: int | None = None, wait_for: str = ""
+    ) -> tuple[str, int, str]:
         browser = await self._ensure_browser()
         await self._rate_limiter.wait(url)
+        settle = _RENDER_SETTLE_MS if wait_ms is None else max(0, wait_ms)
         async with self._semaphore:
             page = await browser.new_page(user_agent=_USER_AGENT)
             try:
@@ -379,10 +409,22 @@ class Scraper:
                 content_type = (
                     response.headers.get("content-type", "") if response is not None else ""
                 )
+                await self._settle(page, settle, wait_for)
                 html = await page.content()
             finally:
                 await page.close()
         return html, status, content_type
+
+    async def _settle(self, page: Any, settle_ms: int, wait_for: str) -> None:
+        """Give a client-rendered page time to populate before reading it."""
+        if wait_for:
+            try:
+                await page.wait_for_selector(wait_for, timeout=int(_TIMEOUT_S * 1000))
+                return
+            except Exception as exc:  # noqa: BLE001 - a missing selector is not fatal
+                log.info("wait_for %r never appeared on %s (%s)", wait_for, page.url, _brief(exc))
+        if settle_ms > 0:
+            await page.wait_for_timeout(settle_ms)
 
     async def _ensure_browser(self) -> Browser:
         """Launch Chromium once, installing it on first use if absent."""
@@ -390,7 +432,18 @@ class Scraper:
         # coroutines that each see `_browser is None` and each launch a browser.
         async with self._browser_lock:
             if self._browser is not None:
-                return self._browser
+                if self._browser.is_connected():
+                    return self._browser
+                # A crashed Chromium stays non-None forever otherwise, so every
+                # later js_render fails until the server restarts.
+                log.info("The browser has disconnected; relaunching")
+                self._browser = None
+                if self._playwright is not None:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:  # noqa: BLE001
+                        log.debug("Failed to stop the old driver", exc_info=True)
+                    self._playwright = None
 
             playwright = await _start_playwright()
             try:
@@ -442,13 +495,18 @@ class Scraper:
             self._rate_limiter.record_success(url)
 
         is_html = _is_html(content_type, html)
+        # One parse, reused. Previously html_to_markdown, page_title, _count_links
+        # and _looks_like_content each re-parsed the same document with lxml,
+        # synchronously on the event loop — seconds of stall on a large page,
+        # blocking every concurrent fetch.
+        soup = BeautifulSoup(html, "lxml") if is_html else None
         return FetchResult(
             url=url,
             html=html,
             markdown=html_to_markdown(html) if (is_html and not blocked) else "",
             status_code=status,
-            title=page_title(html) if is_html else "",
-            links_count=_count_links(html) if is_html else 0,
+            title=_title_from(soup),
+            links_count=len(soup.find_all("a", href=True)) if soup is not None else 0,
             content_type=content_type,
             blocked=blocked,
             block_reason=reason,
@@ -523,8 +581,10 @@ def _is_html(content_type: str, html: str) -> bool:
     return (not ct) or "html" in ct or ct.startswith("text/")
 
 
-def _count_links(html: str) -> int:
-    return len(BeautifulSoup(html, "lxml").find_all("a", href=True))
+def _title_from(soup: Any) -> str:
+    if soup is None or soup.title is None or soup.title.string is None:
+        return ""
+    return str(soup.title.string).strip()
 
 
 async def _install_chromium() -> None:

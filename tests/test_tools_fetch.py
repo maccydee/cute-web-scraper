@@ -82,7 +82,7 @@ async def test_fetch_page_handles_network_error(mcp, holder):
 
 
 async def test_fetch_pages_returns_results_and_errors(mcp, holder):
-    async def fetch(url, *, js_render=False):
+    async def fetch(url, *, js_render=False, **kwargs):
         if "bad" in url:
             raise httpx.ConnectError("boom")
         return _result(url=url)

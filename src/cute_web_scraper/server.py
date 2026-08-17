@@ -171,13 +171,20 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         description=(
             "Fetch one web page and return its content as clean markdown with metadata. "
             "Set js_render=true for pages that need JavaScript to render (SPAs, "
-            "infinite-scroll listings, most modern storefronts)."
+            "infinite-scroll listings, most modern storefronts). "
+            "If a rendered page still comes back sparse, give it longer with wait_ms, "
+            "or wait for a specific element with wait_for (a CSS selector) — that is "
+            "more reliable than a fixed delay."
         )
     )
-    async def fetch_page(url: str, js_render: bool = False) -> str:
+    async def fetch_page(
+        url: str, js_render: bool = False, wait_ms: int = 0, wait_for: str = ""
+    ) -> str:
         log.debug("tool=fetch_page url=%s js_render=%s", url, js_render)
         try:
-            result = await holder.require().fetch(url, js_render=js_render)
+            result = await holder.require().fetch(
+                url, js_render=js_render, wait_ms=wait_ms or None, wait_for=wait_for
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller as text
             log.error("tool=fetch_page failed: %s", exc)
             return f"Error fetching {url}: {_describe(exc)}"
@@ -217,12 +224,23 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             "Set js_render=true for JavaScript-heavy pages. "
             "For more than about 20 URLs, pass save_as='<table_name>' to write the pages "
             "into a result table and get back a summary instead of the full text — then "
-            "use query_table to interrogate it without filling the conversation."
+            "use query_table to interrogate it without filling the conversation. "
+            "When feeding a long URL list through in batches, pass mode='append' on "
+            "every call after the first, or each batch replaces the last."
         )
     )
-    async def fetch_pages(urls: list[str], js_render: bool = False, save_as: str = "") -> str:
+    async def fetch_pages(
+        urls: list[str],
+        js_render: bool = False,
+        save_as: str = "",
+        mode: str = "replace",
+        wait_ms: int = 0,
+        wait_for: str = "",
+    ) -> str:
         scraper = holder.require()
-        results, errors = await _gather_pages(scraper, urls, js_render)
+        results, errors = await _gather_pages(
+            scraper, urls, js_render, wait_ms=wait_ms or None, wait_for=wait_for
+        )
         rows = [
             {
                 "url": r.url,
@@ -236,7 +254,7 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             for r in results
         ]
         return _emit_rows(
-            holder, "fetch_pages", {"results": rows, "errors": errors}, rows, errors, save_as
+            holder, "fetch_pages", {"results": rows, "errors": errors}, rows, errors, save_as, mode
         )
 
 
@@ -267,15 +285,19 @@ def _register_discovery_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             return json.dumps({"url": url, "error": _describe(exc), "urls": []})
 
         truncated = len(urls) > limit
-        return json.dumps(
-            {
-                "url": url,
-                "source": source,
-                "count": len(urls[:limit]),
-                "truncated": truncated,
-                "urls": urls[:limit],
-            },
-            ensure_ascii=False,
+        return _truncate(
+            json.dumps(
+                {
+                    "url": url,
+                    "source": source,
+                    "count": len(urls[:limit]),
+                    "truncated": truncated,
+                    "urls": urls[:limit],
+                },
+                ensure_ascii=False,
+            ),
+            holder.max_inline_chars,
+            hint="Lower `limit`, or narrow the crawl.",
         )
 
     @mcp.tool(
@@ -299,17 +321,21 @@ def _register_discovery_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         except Exception:  # noqa: BLE001
             sitemap_urls = []
 
-        return json.dumps(
-            {
-                "url": url,
-                "status_code": page.status_code,
-                "blocked": page.blocked,
-                "platform": detect_platform(page.html, {}),
-                "sitemap_url": (urljoin(url, "/sitemap.xml") if sitemap_urls else None),
-                "page_count_estimate": len(sitemap_urls),
-                "requires_js": detect_requires_js(page.html),
-            },
-            ensure_ascii=False,
+        return _truncate(
+            json.dumps(
+                {
+                    "url": url,
+                    "status_code": page.status_code,
+                    "blocked": page.blocked,
+                    "via": page.via,
+                    "platform": detect_platform(page.html, {}),
+                    "sitemap_url": (urljoin(url, "/sitemap.xml") if sitemap_urls else None),
+                    "page_count_estimate": len(sitemap_urls),
+                    "requires_js": detect_requires_js(page.html),
+                },
+                ensure_ascii=False,
+            ),
+            holder.max_inline_chars,
         )
 
 
@@ -357,7 +383,9 @@ def _build_extract_tool(
     # A plain closure registered via add_tool. functools.wraps would copy the
     # extractor's __annotations__/__wrapped__ onto this function and publish a
     # wrong tool schema.
-    async def _extract(urls: list[str], js_render: bool = False, save_as: str = "") -> str:
+    async def _extract(
+        urls: list[str], js_render: bool = False, save_as: str = "", mode: str = "replace"
+    ) -> str:
         scraper = holder.require()
         pages, errors = await _gather_pages(scraper, urls, js_render)
         results: list[dict[str, Any]] = []
@@ -366,7 +394,13 @@ def _build_extract_tool(
             # tags, which markdown does not contain.
             results.extend(extractor(page.html, page.url))
         return _emit_rows(
-            holder, tool_name, {"results": results, "errors": errors}, results, errors, save_as
+            holder,
+            tool_name,
+            {"results": results, "errors": errors},
+            results,
+            errors,
+            save_as,
+            mode,
         )
 
     return _extract
@@ -657,11 +691,16 @@ def _register_prompts(mcp: MCPServer) -> None:
 
 
 async def _gather_pages(
-    scraper: Any, urls: list[str], js_render: bool
+    scraper: Any,
+    urls: list[str],
+    js_render: bool,
+    *,
+    wait_ms: int | None = None,
+    wait_for: str = "",
 ) -> tuple[list[FetchResult], list[dict[str, str]]]:
     """Fetch every URL, splitting successes from failures and blocks."""
     settled = await asyncio.gather(
-        *(scraper.fetch(u, js_render=js_render) for u in urls),
+        *(scraper.fetch(u, js_render=js_render, wait_ms=wait_ms, wait_for=wait_for) for u in urls),
         return_exceptions=True,
     )
     pages: list[FetchResult] = []
@@ -681,21 +720,29 @@ def _save_and_summarise(
     table: str,
     rows: list[dict[str, Any]],
     errors: list[dict[str, str]],
+    mode: str = "replace",
 ) -> str:
-    """Write rows to a table and return a compact summary instead of the data."""
+    """Write rows to a table and return a compact summary instead of the data.
+
+    mode="append" adds to an existing table. Without it, scraping a long URL list
+    in batches into one table silently kept only the final batch, because every
+    save dropped the table first.
+    """
     if not rows:
         return json.dumps(
             {"saved_to": table, "row_count": 0, "errors": errors, "results": []},
             ensure_ascii=False,
         )
+    store = holder.require_store()
     try:
-        info = holder.require_store().save(table, rows)
+        info = store.append(table, rows) if mode == "append" else store.save(table, rows)
     except StoreError as exc:
         return json.dumps({"error": _describe(exc), "errors": errors})
-    sample = holder.require_store().get_table(info.name, sample=3).sample
+    sample = store.get_table(info.name, sample=3).sample
     return json.dumps(
         {
             "saved_to": info.name,
+            "mode": mode,
             "row_count": info.row_count,
             "columns": info.columns,
             "sample": _shrink_sample(sample),
@@ -773,6 +820,7 @@ def _emit_rows(
     rows: list[dict[str, Any]],
     errors: list[dict[str, str]],
     save_as: str,
+    mode: str = "replace",
 ) -> str:
     """Return rows inline when small, otherwise save them to a table.
 
@@ -782,7 +830,7 @@ def _emit_rows(
     query to get at them.
     """
     if save_as:
-        return _save_and_summarise(holder, save_as, rows, errors)
+        return _save_and_summarise(holder, save_as, rows, errors, mode)
 
     text = json.dumps(payload, ensure_ascii=False)
     if len(text) <= holder.max_inline_chars:

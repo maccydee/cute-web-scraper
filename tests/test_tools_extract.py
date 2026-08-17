@@ -76,7 +76,7 @@ async def test_extract_social_links_uses_html(mcp, holder):
 
 
 async def test_partial_failure_is_reported(mcp, holder):
-    async def fetch(url, *, js_render=False):
+    async def fetch(url, *, js_render=False, **kwargs):
         if "bad" in url:
             raise httpx.ConnectError("boom")
         return _realistic(url=url)

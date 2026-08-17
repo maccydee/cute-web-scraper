@@ -10,6 +10,8 @@ import csv
 import json
 import re
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -75,12 +77,23 @@ class ResultStore:
     def path(self) -> Path:
         return self._path
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open, commit-or-rollback, and *close*.
+
+        sqlite3's own connection context manager commits but never closes, so
+        `with self._connect() as conn` leaked a handle on every store call —
+        list_tables leaked N+1.
+        """
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
-    def _connect_readonly(self) -> sqlite3.Connection:
+    def _connect_readonly(self) -> sqlite3.Connection:  # caller closes explicitly
         # A genuine read-only handle: SQLite itself refuses writes, so this holds
         # even if a write statement slips past the keyword check.
         conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True)

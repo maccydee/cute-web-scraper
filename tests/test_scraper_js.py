@@ -142,7 +142,7 @@ async def test_blocked_browser_falls_back_to_impersonation(httpx_mock):
     """ASOS 403s Playwright but lets curl_cffi through; js_render must not lose that."""
     httpx_mock.add_response(status_code=403)
 
-    async def rendered(self, url):
+    async def rendered(self, url, **kwargs):
         return "", 403, "text/html"
 
     async def impersonated(self, url, profile):
@@ -155,12 +155,12 @@ async def test_blocked_browser_falls_back_to_impersonation(httpx_mock):
         ):
             result = await s.fetch("https://asos.example", js_render=True)
     assert result.blocked is False
-    assert result.via == "impersonate:chrome131"
+    assert result.via == "impersonate:chrome"
     assert "# Products" in result.markdown
 
 
 async def test_successful_render_does_not_fall_back(httpx_mock):
-    async def rendered(self, url):
+    async def rendered(self, url, **kwargs):
         return "<h1>Rendered</h1>", 200, "text/html"
 
     async def impersonated(self, url, profile):
@@ -178,7 +178,7 @@ async def test_successful_render_does_not_fall_back(httpx_mock):
 async def test_both_routes_blocked_keeps_the_browser_answer(httpx_mock):
     httpx_mock.add_response(status_code=403)
 
-    async def rendered(self, url):
+    async def rendered(self, url, **kwargs):
         return "<p>browser block</p>", 403, "text/html"
 
     async def impersonated(self, url, profile):
@@ -231,7 +231,7 @@ async def test_stealth_runs_only_after_everything_else_failed(httpx_mock):
         order.append(f"impersonate:{profile}")
         return "", 403, "text/html"
 
-    async def stealth(self, url):
+    async def stealth(self, url, **kwargs):
         order.append("stealth")
         return "<h1>Reviews</h1>", 200, "text/html"
 
@@ -241,7 +241,7 @@ async def test_stealth_runs_only_after_everything_else_failed(httpx_mock):
             patch.object(Scraper, "_fetch_stealth", new=stealth),
         ):
             result = await s.fetch("https://trustpilot.example")
-    assert order == ["impersonate:chrome131", "impersonate:safari17_0", "stealth"]
+    assert order == ["impersonate:chrome", "impersonate:safari", "stealth"]
     assert result.via == "stealth"
     assert result.blocked is False
 
@@ -249,7 +249,7 @@ async def test_stealth_runs_only_after_everything_else_failed(httpx_mock):
 async def test_stealth_never_runs_when_an_earlier_tier_worked(httpx_mock):
     httpx_mock.add_response(html="<h1>Fine</h1>")
 
-    async def stealth(self, url):
+    async def stealth(self, url, **kwargs):
         raise AssertionError("stealth must be a last resort")
 
     async with Scraper(_config(impersonate=True)) as s:
@@ -264,7 +264,7 @@ async def test_stealth_can_be_disabled(httpx_mock):
     async def impersonated(self, url, profile):
         return "", 403, "text/html"
 
-    async def stealth(self, url):
+    async def stealth(self, url, **kwargs):
         raise AssertionError("must not run when disabled")
 
     async with Scraper(_config(impersonate=True, stealth=False)) as s:
@@ -283,7 +283,7 @@ async def test_a_failing_stealth_tier_is_not_fatal(httpx_mock):
     async def impersonated(self, url, profile):
         return "", 403, "text/html"
 
-    async def stealth(self, url):
+    async def stealth(self, url, **kwargs):
         raise RuntimeError("stealth browser exploded")
 
     async with Scraper(_config(impersonate=True)) as s:
@@ -293,3 +293,97 @@ async def test_a_failing_stealth_tier_is_not_fatal(httpx_mock):
         ):
             result = await s.fetch("https://blocked.example")
     assert result.blocked is True  # reported honestly, not crashed
+
+
+# ------------------------------------------------------------ render settling
+
+
+async def test_render_settles_before_reading_content():
+    """Found by review: goto() returns on `load`, before an SPA has painted, and
+    content() was read immediately. The stealth tier waited 4s; this one waited 0."""
+    waits: list[int] = []
+    page = AsyncMock()
+    page.content = AsyncMock(return_value="<h1>ok</h1>")
+    page.goto = AsyncMock(return_value=None)
+    page.wait_for_timeout = AsyncMock(side_effect=lambda ms: waits.append(ms))
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config()) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            await s.fetch("https://spa.example", js_render=True)
+    assert waits and waits[0] > 0, "a rendered page must be given time to populate"
+
+
+async def test_wait_for_selector_is_preferred_over_a_fixed_delay():
+    page = AsyncMock()
+    page.content = AsyncMock(return_value="<h1>ok</h1>")
+    page.goto = AsyncMock(return_value=None)
+    page.wait_for_selector = AsyncMock(return_value=None)
+    page.wait_for_timeout = AsyncMock()
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config()) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            await s.fetch("https://spa.example", js_render=True, wait_for=".results")
+    page.wait_for_selector.assert_awaited_once()
+    page.wait_for_timeout.assert_not_awaited()
+
+
+async def test_a_missing_selector_falls_back_to_the_delay():
+    page = AsyncMock()
+    page.content = AsyncMock(return_value="<h1>ok</h1>")
+    page.goto = AsyncMock(return_value=None)
+    page.wait_for_selector = AsyncMock(side_effect=RuntimeError("timeout"))
+    page.wait_for_timeout = AsyncMock()
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config()) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            result = await s.fetch("https://spa.example", js_render=True, wait_for=".nope")
+    page.wait_for_timeout.assert_awaited()
+    assert result.blocked is False
+
+
+async def test_a_tuned_wait_bypasses_the_cache():
+    """A caller asking for a longer wait wants a fresh render, not the cached one."""
+    page = AsyncMock()
+    page.content = AsyncMock(return_value="<h1>ok</h1>")
+    page.goto = AsyncMock(return_value=None)
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config(cache_ttl_s=300)) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            first = await s.fetch("https://spa.example", js_render=True)
+            again = await s.fetch("https://spa.example", js_render=True)
+            tuned = await s.fetch("https://spa.example", js_render=True, wait_ms=3000)
+    assert first.from_cache is False
+    assert again.from_cache is True
+    assert tuned.from_cache is False
+
+
+async def test_a_disconnected_browser_is_relaunched():
+    """A crashed Chromium stayed non-None forever, failing every later js_render."""
+    dead = AsyncMock()
+    dead.is_connected = lambda: False
+    live_page = AsyncMock()
+    live_page.content = AsyncMock(return_value="<h1>back</h1>")
+    live_page.goto = AsyncMock(return_value=None)
+    live = AsyncMock()
+    live.is_connected = lambda: True
+    live.new_page = AsyncMock(return_value=live_page)
+
+    async def relaunch(self, playwright):
+        return live
+
+    async with Scraper(_config()) as s:
+        s._browser = dead
+        with (
+            patch("cute_web_scraper.scraper._start_playwright", new=AsyncMock()),
+            patch.object(Scraper, "_launch", new=relaunch),
+        ):
+            result = await s.fetch("https://example.com", js_render=True)
+    assert "# back" in result.markdown
