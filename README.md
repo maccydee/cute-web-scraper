@@ -1,13 +1,35 @@
+<!-- mcp-name: io.github.maccydee/cute-web-scraper -->
+
 # cute-web-scraper
 
-An MCP server that gives Claude web scraping powers.
+**An MCP server that gives Claude web scraping powers.** Free, local, no API key, no cloud account.
 
-Ask Claude to scrape a site in plain English. It fetches the pages, renders the JavaScript when needed, and hands back clean markdown or structured data — no selectors, no glue code.
+[![CI](https://github.com/maccydee/cute-web-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/maccydee/cute-web-scraper/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-server-8A2BE2.svg)](https://modelcontextprotocol.io)
+[![Tests](https://img.shields.io/badge/tests-311%20passing-brightgreen.svg)](#development)
 
-- **Whole sites, not single pages.** Discover every URL from a sitemap, then fetch them in parallel.
-- **Contacts and links.** Pull emails, phone numbers, hyperlinks and social profiles from a list of URLs.
-- **Markdown, not HTML.** Pages come back as clean markdown, with navigation, cookie banners and footers stripped from articles. A BBC news page drops from 20,519 characters to 3,198.
-- **PDFs too.** A link to a PDF is extracted to text rather than silently skipped.
+Ask in plain English. It fetches the pages, renders the JavaScript when needed, gets past the blocks, and hands back clean markdown or a queryable table — no selectors, no glue code.
+
+```
+Get the title, price and stock for every book on books.toscrape.com,
+save it as `catalogue`, then show me anything under £51 that's in stock.
+```
+
+```
+extract_by_selector -> 20 rows
+  A Light in the Attic                 £51.77    In stock
+  Tipping the Velvet                   £53.74    In stock
+  Soumission                           £50.10    In stock
+```
+
+### Why this one
+
+- **It gets in.** Four escalating tiers — plain HTTP, browser TLS fingerprints, a real browser, then a stealth browser. ASOS, eBay, Booking.com and Trustpilot all return real data, on a home connection with no proxies.
+- **It doesn't waste your context.** Articles are stripped of navigation, cookie banners and footers: a BBC news page goes from **20,513 characters to 3,198**. Large results land in a SQLite table you query with SQL instead of pasting into the chat.
+- **It tells the truth about failure.** Five of the sites tested served a refusal under a *success* status — an interstitial under HTTP 200, a bot check under 202 — and one served real content under 403. Block detection weighs the page body, not the status code, so you don't get a stub reported as data.
+- **Whole sites, not single pages.** Sitemap discovery, parallel fetching, and 24 tools covering products, contacts, Shopify catalogues, places, PDFs and change tracking.
 
 ## Install
 
