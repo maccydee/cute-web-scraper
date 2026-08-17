@@ -1,0 +1,49 @@
+<meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { width:1100px; background:#0d1117; padding:26px;
+         font-family:ui-monospace,"SF Mono",Menlo,monospace; }
+  .win { background:#161b22; border:1px solid #30363d; border-radius:11px; overflow:hidden; }
+  .bar { height:38px; background:#21262d; display:flex; align-items:center; padding:0 15px; gap:8px;
+         border-bottom:1px solid #30363d; }
+  .dot { width:12px; height:12px; border-radius:50%; }
+  .bar span { margin-left:14px; font-size:13px; color:#7d8590; }
+  .body { padding:22px 26px 26px; font-size:15px; line-height:1.72; }
+  .you { color:#58a6ff; font-weight:600; }
+  .prompt { color:#e6edf3; }
+  .tool { color:#8b5cf6; }
+  .dim { color:#7d8590; }
+  .ok { color:#3fb950; }
+  .val { color:#f0883e; }
+  .rule { height:1px; background:#30363d; margin:17px 0; }
+  table { border-collapse:collapse; margin:3px 0 0 20px; font-size:14.5px; }
+  td { padding:2px 26px 2px 0; color:#adbac7; }
+  td.t { color:#e6edf3; }
+</style>
+<div class="win">
+  <div class="bar">
+    <div class="dot" style="background:#ff5f56"></div>
+    <div class="dot" style="background:#ffbd2e"></div>
+    <div class="dot" style="background:#27c93f"></div>
+    <span>claude — cute-web-scraper</span>
+  </div>
+  <div class="body">
+    <div><span class="you">&gt;</span> <span class="prompt">Get the title, price and stock for every book on</span></div>
+    <div><span class="prompt">&nbsp;&nbsp;books.toscrape.com, save it as <span class="val">catalogue</span>, then show me</span></div>
+    <div><span class="prompt">&nbsp;&nbsp;anything under £51 that's in stock.</span></div>
+    <div class="rule"></div>
+    <div><span class="tool">⏺ fetch_page</span><span class="dim">(books.toscrape.com)</span></div>
+    <div class="dim">&nbsp;&nbsp;└ 200 · via <span class="ok">httpx</span> · 50KB</div>
+    <div><span class="tool">⏺ extract_by_selector</span><span class="dim">(row=article.product_pod)</span></div>
+    <div class="dim">&nbsp;&nbsp;└ <span class="ok">20 rows</span> → saved as <span class="val">catalogue</span></div>
+    <div><span class="tool">⏺ query_table</span><span class="dim">(WHERE price &lt; 51 AND stock LIKE '%In stock%')</span></div>
+    <div class="rule"></div>
+    <table>
+      <tr><td class="t">Soumission</td><td class="val">£50.10</td><td class="ok">In stock</td></tr>
+      <tr><td class="t">Sharp Objects</td><td class="val">£47.82</td><td class="ok">In stock</td></tr>
+      <tr><td class="t">The Requiem Red</td><td class="val">£22.65</td><td class="ok">In stock</td></tr>
+      <tr><td class="t">The Dirty Little Secrets of Ge…</td><td class="val">£33.34</td><td class="ok">In stock</td></tr>
+    </table>
+    <div class="dim" style="margin-top:15px">&nbsp;&nbsp;13 of 20 matched · full table kept in SQLite, not your context</div>
+  </div>
+</div>

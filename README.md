@@ -12,17 +12,9 @@
 
 Ask in plain English. It fetches the pages, renders the JavaScript when needed, gets past the blocks, and hands back clean markdown or a queryable table — no selectors, no glue code.
 
-```
-Get the title, price and stock for every book on books.toscrape.com,
-save it as `catalogue`, then show me anything under £51 that's in stock.
-```
-
-```
-extract_by_selector -> 20 rows
-  A Light in the Attic                 £51.77    In stock
-  Tipping the Velvet                   £53.74    In stock
-  Soumission                           £50.10    In stock
-```
+<p align="center">
+  <img src="docs/images/demo.png" alt="Claude scraping a book catalogue and querying it with SQL" width="820">
+</p>
 
 ### Why this one
 
