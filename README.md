@@ -6,7 +6,8 @@ Ask Claude to scrape a site in plain English. It fetches the pages, renders the 
 
 - **Whole sites, not single pages.** Discover every URL from a sitemap, then fetch them in parallel.
 - **Contacts and links.** Pull emails, phone numbers, hyperlinks and social profiles from a list of URLs.
-- **Markdown, not HTML.** Pages come back as clean markdown, which is far cheaper on context than raw HTML.
+- **Markdown, not HTML.** Pages come back as clean markdown, with navigation, cookie banners and footers stripped from articles. A BBC news page drops from 20,519 characters to 3,198.
+- **PDFs too.** A link to a PDF is extracted to text rather than silently skipped.
 
 ## Install
 
@@ -43,6 +44,7 @@ Scrape every product from https://example-shop.com and give me a CSV of name and
 
 | Tool | What it does |
 |---|---|
+| `extract_by_selector` | Arbitrary fields via CSS selectors — turns any listing into a table |
 | `extract_products` | Structured product data (name, price, currency, availability, brand, sku, rating) from JSON-LD, OpenGraph or microdata |
 | `extract_emails` | Email addresses across a list of URLs, with surrounding context |
 | `extract_phones` | Phone numbers across a list of URLs, with surrounding context |
@@ -69,6 +71,21 @@ Scrape every product from https://example-shop.com and give me a CSV of name and
 | `drop_table` | Delete a saved table |
 
 A typical run composes them: `analyze_website` → `crawl_site` → `fetch_pages` → `query_table`.
+
+### Extracting arbitrary fields
+
+`extract_by_selector` covers everything the fixed extractors do not:
+
+```
+Get the title, price and link from every product on these 40 pages,
+save it as `catalogue`, then show me anything under £50.
+```
+
+`fields` maps column names to CSS selectors. `row_selector` makes each match a row — that is what turns a listing into a table. An `@attr` suffix reads an attribute instead of text, with `href` and `src` resolved to absolute URLs:
+
+```json
+{"name": "h3 a@title", "price": ".price_color", "link": "h3 a@href"}
+```
 
 ### Slash commands
 
@@ -158,7 +175,11 @@ Everything is an environment variable, with defaults that work unconfigured.
 | `SCRAPER_DB_PATH` | `~/.cute-web-scraper/results.db` | Where result tables are stored |
 | `SCRAPER_MAX_INLINE_CHARS` | `25000` | Ceiling on how much a single tool returns inline |
 
+Batching a long URL list into one table needs `mode: "append"` on every call after the first, or each batch replaces the last. Rendered pages that come back sparse can be given `wait_ms`, or better `wait_for` with a CSS selector.
+
 ## How it behaves
+
+**Main content, not the whole page.** Article-shaped pages are run through trafilatura, which isolates the body and drops the surrounding furniture — chosen because on an independent 2,008-page benchmark it scores 0.791 F1 against Readability's 0.674. It is applied per page rather than universally: the same benchmark shows extractors diverging by 20–30 points on product grids and collections, where "main content" is not an article, so listing pages keep the full document. Pass `main_content: false` to force that anywhere.
 
 **Four tiers, escalating only when refused.** A plain HTTP client handles most pages. If a site refuses, the request retries with real browser TLS fingerprints (Chrome, then Safari), because some sites fingerprint the TLS handshake itself and no header change gets past them. `js_render: true` renders in Chromium for single-page apps. As a last resort, a stealth-patched browser handles sites that need JavaScript *and* reject ordinary automation.
 
