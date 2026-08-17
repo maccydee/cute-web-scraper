@@ -303,3 +303,88 @@ async def test_extract_tools_support_append(mcp, holder):
         mcp, "extract_links", {"urls": ["https://b.com"], "save_as": "links", "mode": "append"}
     )
     assert holder.require_store().get_table("links").row_count == before * 2
+
+
+# --------------------------------------------------------- extract_by_selector
+
+LISTING_HTML = (
+    "<html><body>"
+    "<div class='card'><h2 class='t'>Alpha</h2><span class='p'>£10</span>"
+    "<a class='l' href='/a'>go</a></div>"
+    "<div class='card'><h2 class='t'>Beta</h2><span class='p'>£20</span>"
+    "<a class='l' href='/b'>go</a></div>"
+    "</body></html>"
+)
+
+
+@pytest.fixture
+def listing_holder(store, tmp_path):
+    config = Config(
+        delay_ms=0,
+        max_concurrent=5,
+        auth_token=None,
+        user_data_dir=None,
+        cache_ttl_s=0,
+        cache_max_entries=10,
+        db_path=tmp_path / "r.db",
+        max_inline_chars=50_000,
+    )
+    h = ScraperHolder()
+    h.set(
+        AsyncMock(fetch=AsyncMock(return_value=_page(html=LISTING_HTML))),
+        store=store,
+        config=config,
+    )
+    return h
+
+
+async def test_selector_tool_turns_a_listing_into_rows(listing_holder):
+    mcp = create_server(listing_holder)
+    payload = await _json(
+        mcp,
+        "extract_by_selector",
+        {
+            "urls": ["https://shop.example"],
+            "fields": {"name": ".t", "price": ".p", "link": ".l@href"},
+            "row_selector": ".card",
+        },
+    )
+    assert len(payload["results"]) == 2
+    assert payload["results"][0]["name"] == "Alpha"
+    assert payload["results"][1]["price"] == "£20"
+    assert payload["results"][0]["link"].endswith("/a")
+
+
+async def test_selector_tool_saves_to_a_table(listing_holder):
+    mcp = create_server(listing_holder)
+    payload = await _json(
+        mcp,
+        "extract_by_selector",
+        {
+            "urls": ["https://shop.example"],
+            "fields": {"name": ".t"},
+            "row_selector": ".card",
+            "save_as": "items",
+        },
+    )
+    assert payload["saved_to"] == "items"
+    assert payload["row_count"] == 2
+
+
+async def test_selector_tool_requires_fields(listing_holder):
+    mcp = create_server(listing_holder)
+    payload = await _json(
+        mcp, "extract_by_selector", {"urls": ["https://shop.example"], "fields": {}}
+    )
+    assert "error" in payload
+
+
+async def test_selector_tool_reports_pages_that_matched_nothing(listing_holder):
+    mcp = create_server(listing_holder)
+    payload = await _json(
+        mcp,
+        "extract_by_selector",
+        {"urls": ["https://shop.example"], "fields": {"x": ".nothing-here"}},
+    )
+    assert payload["results"] == []
+    assert "no elements matched" in payload["errors"][0]["error"]

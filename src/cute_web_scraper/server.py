@@ -76,6 +76,7 @@ def create_server(holder: ScraperHolder) -> MCPServer:
     _register_discovery_tools(mcp, holder)
     _register_extract_tools(mcp, holder)
     _register_product_tools(mcp, holder)
+    _register_selector_tool(mcp, holder)
     _register_shopify_tools(mcp, holder)
     _register_place_tools(mcp, holder)
     _register_table_tools(mcp, holder)
@@ -174,16 +175,29 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             "infinite-scroll listings, most modern storefronts). "
             "If a rendered page still comes back sparse, give it longer with wait_ms, "
             "or wait for a specific element with wait_for (a CSS selector) — that is "
-            "more reliable than a fixed delay."
+            "more reliable than a fixed delay. "
+            "Article-shaped pages have their navigation, cookie banners and footers "
+            "stripped automatically; set main_content=false to keep the whole page. "
+            "PDFs are extracted to text."
         )
     )
     async def fetch_page(
-        url: str, js_render: bool = False, wait_ms: int = 0, wait_for: str = ""
+        url: str,
+        js_render: bool = False,
+        wait_ms: int = 0,
+        wait_for: str = "",
+        main_content: bool = True,
     ) -> str:
         log.debug("tool=fetch_page url=%s js_render=%s", url, js_render)
         try:
             result = await holder.require().fetch(
-                url, js_render=js_render, wait_ms=wait_ms or None, wait_for=wait_for
+                url,
+                js_render=js_render,
+                wait_ms=wait_ms or None,
+                wait_for=wait_for,
+                # True means "decide per page"; only an explicit false forces the
+                # whole document.
+                main_content=None if main_content else False,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller as text
             log.error("tool=fetch_page failed: %s", exc)
@@ -404,6 +418,52 @@ def _build_extract_tool(
         )
 
     return _extract
+
+
+def _register_selector_tool(mcp: MCPServer, holder: ScraperHolder) -> None:
+    @mcp.tool(
+        description=(
+            "Extract arbitrary fields from pages using CSS selectors — the general "
+            "case the fixed extractors do not cover. `fields` maps output column "
+            'names to selectors, e.g. {"name": "h1", "price": ".price"}. '
+            "Set `row_selector` when a page holds a list: each match becomes a row and "
+            "the field selectors resolve inside it, which turns a listing into a "
+            "table. Suffix a selector with @attr to read an attribute instead of "
+            'text — "a@href" gives the link, resolved to an absolute URL. '
+            "Pass save_as to store the rows; add mode='append' when batching."
+        )
+    )
+    async def extract_by_selector(
+        urls: list[str],
+        fields: dict[str, str],
+        row_selector: str = "",
+        js_render: bool = False,
+        save_as: str = "",
+        mode: str = "replace",
+    ) -> str:
+        if not fields:
+            return json.dumps(
+                {"error": "Provide at least one field, e.g. {'title': 'h1'}", "results": []}
+            )
+        scraper = holder.require()
+        pages, errors = await _gather_pages(scraper, urls, js_render)
+        rows: list[dict[str, Any]] = []
+        for page in pages:
+            found = extractors.extract_by_selector(
+                page.html, page.url, fields, row_selector=row_selector
+            )
+            if not found:
+                errors.append({"url": page.url, "error": "no elements matched those selectors"})
+            rows.extend(found)
+        return _emit_rows(
+            holder,
+            "extract_by_selector",
+            {"results": rows, "errors": errors},
+            rows,
+            errors,
+            save_as,
+            mode,
+        )
 
 
 def _register_product_tools(mcp: MCPServer, holder: ScraperHolder) -> None:

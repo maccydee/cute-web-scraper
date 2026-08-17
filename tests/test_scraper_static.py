@@ -401,3 +401,83 @@ async def test_bot_check_under_an_unusual_status_is_a_block(httpx_mock):
         result = await s.fetch("https://booking.example")
     assert result.blocked is True
     assert result.block_reason == "challenge"
+
+
+# --------------------------------------------------------------- PDF handling
+
+_PDF = (__import__("pathlib").Path(__file__).parent / "fixtures" / "sample.pdf").read_bytes()
+
+
+async def test_pdf_is_extracted_not_blanked(httpx_mock):
+    """A PDF link used to return front matter and nothing at all."""
+    httpx_mock.add_response(
+        status_code=200, headers={"Content-Type": "application/pdf"}, content=_PDF
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://example.com/report.pdf")
+    assert result.blocked is False
+    assert "Quarterly revenue was 4.2 million" in result.markdown
+    assert result.content_type.startswith("application/pdf")
+
+
+async def test_a_corrupt_pdf_does_not_crash(httpx_mock):
+    httpx_mock.add_response(
+        status_code=200, headers={"Content-Type": "application/pdf"}, content=b"not a pdf at all"
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://example.com/broken.pdf")
+    assert result.markdown == ""
+    assert result.blocked is False
+
+
+async def test_binary_types_other_than_pdf_are_still_skipped(httpx_mock):
+    httpx_mock.add_response(
+        status_code=200, headers={"Content-Type": "image/png"}, content=b"\x89PNG\r\n\x1a\n"
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://example.com/logo.png")
+    assert result.markdown == ""
+
+
+# ----------------------------------------------------------- main content mode
+
+
+async def test_article_pages_isolate_the_main_body_by_default(httpx_mock):
+    body = "The genuine article body a reader came for. " * 40
+    page = (
+        "<html><head><title>News</title></head><body>"
+        "<nav><a href='/a'>Home</a><a href='/b'>Sport</a></nav>"
+        "<div>We use cookies on this site. Accept all cookies?</div>"
+        f"<article><h1>Headline</h1><p>{body}</p></article>"
+        "<footer>Copyright 2026 Example Media Group</footer>"
+        "</body></html>"
+    )
+    httpx_mock.add_response(html=page)
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://news.example/story")
+    assert "genuine article body" in result.markdown
+    assert "cookies" not in result.markdown.lower()
+    assert "Copyright 2026" not in result.markdown
+
+
+async def test_listing_pages_keep_the_whole_document(httpx_mock):
+    listing = (
+        "<html><body><div class='grid'>"
+        + "".join(f"<a href='/p/{i}'>Product {i}</a>" for i in range(40))
+        + "</div></body></html>"
+    )
+    httpx_mock.add_response(html=listing)
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://shop.example/all")
+    assert "Product 7" in result.markdown
+
+
+async def test_main_content_can_be_forced_off(httpx_mock):
+    body = "The genuine article body a reader came for. " * 40
+    page = (
+        f"<html><body><article><p>{body}</p></article><footer>Copyright 2026</footer></body></html>"
+    )
+    httpx_mock.add_response(html=page)
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://news.example/story", main_content=False)
+    assert "Copyright 2026" in result.markdown

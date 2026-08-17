@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 from .cache import PageCache
 from .config import Config
-from .converter import html_to_markdown
+from .converter import html_to_markdown, looks_like_an_article
 from .rate_limiter import DomainRateLimiter
 
 if TYPE_CHECKING:  # playwright is heavy; keep it out of module import
@@ -39,6 +39,9 @@ _RENDER_SETTLE_MS = 1500
 fetched and painted anything. Reading content() straight after it is a race that
 returns the empty shell — the exact case js_render exists for.
 """
+
+_PDF_MAX_PAGES = 100
+"""Cap on PDF pages extracted, so a 2,000-page document cannot stall a fetch."""
 
 _STEALTH_SETTLE_MS = 4000
 """The stealth tier waits longer: it is the last resort, on the hardest sites."""
@@ -163,6 +166,7 @@ class Scraper:
         js_render: bool = False,
         wait_ms: int | None = None,
         wait_for: str = "",
+        main_content: bool | None = None,
     ) -> FetchResult:
         _validate_url(url)
         # A tuned wait means the caller wants a fresh render, not a cached one.
@@ -178,7 +182,7 @@ class Scraper:
         else:
             html, status, content_type, via = await self._fetch_static_escalating(url)
 
-        result = self._build_result(url, html, status, content_type, via)
+        result = self._build_result(url, html, status, content_type, via, main_content)
         if use_cache:
             self._cache.put(url, js_render, result)
         return result
@@ -302,8 +306,7 @@ class Scraper:
             log.debug("GET %s", url)
             response = await self.http.get(url)
         content_type = response.headers.get("content-type", "")
-        # Decoding a PDF or image as text produces garbage; skip the body entirely.
-        body = response.text if _is_texty(content_type) else ""
+        body = _decode_body(response, content_type)
         return body, response.status_code, content_type
 
     async def _impersonate_session(self, profile: str) -> Any:
@@ -352,7 +355,7 @@ class Scraper:
                 allow_redirects=True,
             )
         content_type = str(response.headers.get("content-type", ""))
-        body = response.text if _is_texty(content_type) else ""
+        body = _decode_body(response, content_type)
         return body, int(response.status_code), content_type
 
     async def _ensure_stealth_browser(self) -> Browser:
@@ -480,7 +483,13 @@ class Scraper:
         return await playwright.chromium.launch(headless=True)
 
     def _build_result(
-        self, url: str, html: str, status: int, content_type: str, via: str = "httpx"
+        self,
+        url: str,
+        html: str,
+        status: int,
+        content_type: str,
+        via: str = "httpx",
+        main_content: bool | None = None,
     ) -> FetchResult:
         blocked, reason = _detect_block(status, html)
         if blocked:
@@ -500,10 +509,19 @@ class Scraper:
         # synchronously on the event loop — seconds of stall on a large page,
         # blocking every concurrent fetch.
         soup = BeautifulSoup(html, "lxml") if is_html else None
+        # None means "decide per page": isolate the article on prose-shaped pages,
+        # keep the whole document on listings and grids where extraction misfires.
+        isolate = looks_like_an_article(html) if main_content is None else main_content
+        if blocked:
+            markdown = ""
+        elif is_html:
+            markdown = html_to_markdown(html, main_content=isolate)
+        else:
+            markdown = _text_from_document(html, content_type)
         return FetchResult(
             url=url,
             html=html,
-            markdown=html_to_markdown(html) if (is_html and not blocked) else "",
+            markdown=markdown,
             status_code=status,
             title=_title_from(soup),
             links_count=len(soup.find_all("a", href=True)) if soup is not None else 0,
@@ -572,6 +590,56 @@ def _looks_like_content(html: str) -> bool:
 def _is_texty(content_type: str) -> bool:
     ct = content_type.lower()
     return (not ct) or ct.startswith("text/") or "html" in ct or "xml" in ct or "json" in ct
+
+
+def _is_pdf(content_type: str) -> bool:
+    return "pdf" in content_type.lower()
+
+
+def _decode_body(response: Any, content_type: str) -> str:
+    """Turn a response into text, including PDFs.
+
+    Decoding a PDF as text produces garbage, so it used to be blanked — which meant
+    fetch_page on a PDF link returned front matter and nothing at all. Links to PDFs
+    are common enough that silently dropping them is a real hole.
+    """
+    if _is_pdf(content_type):
+        return _pdf_to_text(response.content)
+    return str(response.text) if _is_texty(content_type) else ""
+
+
+def _pdf_to_text(data: bytes) -> str:
+    """Extract text from a PDF with pypdf (BSD-3).
+
+    Deliberately not PyMuPDF: it is faster but AGPL-3.0, which would force the same
+    licence on this MIT project.
+    """
+    if not data:
+        return ""
+    try:
+        from io import BytesIO
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(data))
+        pages = []
+        for index, page in enumerate(reader.pages[:_PDF_MAX_PAGES], start=1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                pages.append(f"## Page {index}\n\n{text}")
+        if len(reader.pages) > _PDF_MAX_PAGES:
+            pages.append(
+                f"\n[Truncated: {len(reader.pages)} pages, first {_PDF_MAX_PAGES} extracted]"
+            )
+        return "\n\n".join(pages)
+    except Exception as exc:  # noqa: BLE001 - a broken PDF is not a crash
+        log.info("Could not extract PDF text: %s", _brief(exc))
+        return ""
+
+
+def _text_from_document(body: str, content_type: str) -> str:
+    """Non-HTML bodies are already text by the time they get here."""
+    return body if (_is_pdf(content_type) or _is_texty(content_type)) else ""
 
 
 def _is_html(content_type: str, html: str) -> bool:

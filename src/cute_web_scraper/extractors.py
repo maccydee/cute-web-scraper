@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
@@ -119,3 +120,51 @@ def _accept_any(_: str) -> bool:
 def _is_plausible_phone(value: str) -> bool:
     digits = sum(c.isdigit() for c in value)
     return _MIN_PHONE_DIGITS <= digits <= _MAX_PHONE_DIGITS
+
+
+def extract_by_selector(
+    html: str, url: str, fields: dict[str, str], *, row_selector: str = ""
+) -> list[dict[str, str]]:
+    """Pull arbitrary fields out of a page with CSS selectors.
+
+    The fixed extractors (email, phone, link, social, product) cover common shapes,
+    but anything else — "the h1 and .price from these 200 pages" — had no path except
+    dumping whole pages into the conversation.
+
+    Without `row_selector` the page yields one row, each field taking that selector's
+    first match. With it, each matching element becomes a row and the field selectors
+    are resolved *within* that element, which is what turns a listing into a table.
+
+    A selector suffixed with `@attr` reads that attribute instead of the text, so
+    `"link": "a@href"` gives the URL rather than the anchor text.
+    """
+    if not html or not fields:
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    scopes = soup.select(row_selector) if row_selector else [soup]
+    rows: list[dict[str, str]] = []
+    for scope in scopes:
+        row: dict[str, str] = {"url": url}
+        for name, selector in fields.items():
+            row[name] = _select_value(scope, selector, url) or ""
+        if any(value for key, value in row.items() if key != "url"):
+            rows.append(row)
+    return rows
+
+
+def _select_value(scope: Any, selector: str, url: str) -> str | None:
+    expression, _, attribute = selector.partition("@")
+    try:
+        node = scope.select_one(expression.strip()) if expression.strip() else scope
+    except Exception:  # noqa: BLE001 - an invalid selector yields nothing, not a crash
+        return None
+    if node is None:
+        return None
+    if attribute:
+        raw = node.get(attribute.strip())
+        if raw is None:
+            return None
+        value = " ".join(raw) if isinstance(raw, list) else str(raw)
+        # Resolve href/src so the caller gets something fetchable.
+        return urljoin(url, value) if attribute.strip() in ("href", "src") else value
+    return node.get_text(" ", strip=True) or None
