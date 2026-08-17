@@ -127,6 +127,7 @@ class Scraper:
         self._stealth_cm: Any = None
         self._stealth_lock = asyncio.Lock()
         self.last_action_log: list[str] = []
+        self._browser_ua: str | None = None
 
     async def __aenter__(self) -> Scraper:
         self._client = httpx.AsyncClient(
@@ -417,7 +418,7 @@ class Scraper:
         captured: list[dict[str, Any]] = []
 
         async with self._semaphore:
-            page = await browser.new_page(user_agent=_USER_AGENT)
+            page = await browser.new_page(user_agent=await self._browser_user_agent(browser))
 
             async def on_response(response: Any) -> None:
                 try:
@@ -485,7 +486,7 @@ class Scraper:
         await self._rate_limiter.wait(url)
         settle = _RENDER_SETTLE_MS if wait_ms is None else max(0, wait_ms)
         async with self._semaphore:
-            page = await browser.new_page(user_agent=_USER_AGENT)
+            page = await browser.new_page(user_agent=await self._browser_user_agent(browser))
             try:
                 response = await page.goto(url, timeout=int(_TIMEOUT_S * 1000))
                 status = response.status if response is not None else 0
@@ -574,6 +575,27 @@ class Scraper:
             clicks += 1
             await page.wait_for_timeout(_SCROLL_PAUSE_MS)
         return clicks
+
+    async def _browser_user_agent(self, browser: Any) -> str:
+        """The browser's own UA, with the headless marker removed.
+
+        Playwright's headless Chromium advertises `HeadlessChrome/151...`, which is a
+        plain automation flag: Reddit answers it with a 190KB shell and answers the
+        same browser without it with the full 848KB page. Stripping "Headless" is not
+        a disguise — this really is Chrome, and the marker is an artefact of how it
+        was started rather than anything true about the request.
+        """
+        if self._browser_ua is None:
+            try:
+                page = await browser.new_page()
+                try:
+                    raw = str(await page.evaluate("navigator.userAgent"))
+                finally:
+                    await page.close()
+                self._browser_ua = raw.replace("HeadlessChrome/", "Chrome/")
+            except Exception:  # noqa: BLE001 - fall back to the browser's default
+                self._browser_ua = ""
+        return self._browser_ua
 
     async def _settle(self, page: Any, settle_ms: int, wait_for: str) -> None:
         """Give a client-rendered page time to populate before reading it."""

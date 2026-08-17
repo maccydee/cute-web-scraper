@@ -547,3 +547,43 @@ async def test_actions_bypass_the_cache():
                 "https://x.example", js_render=True, actions=[{"action": "click", "selector": "#a"}]
             )
     assert acted.from_cache is False
+
+
+async def test_the_headless_marker_is_stripped_from_the_user_agent():
+    """Playwright advertises HeadlessChrome/151..., a plain automation flag: Reddit
+    answers it with a 190KB shell and the same browser without it with 1MB."""
+    page = AsyncMock()
+    page.evaluate = AsyncMock(
+        return_value=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36"
+        )
+    )
+    page.close = AsyncMock()
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config()) as s:
+        ua = await s._browser_user_agent(browser)
+    assert "HeadlessChrome" not in ua
+    assert "Chrome/151.0.7922.34" in ua
+
+
+async def test_the_user_agent_is_resolved_once_and_reused():
+    page = AsyncMock()
+    page.evaluate = AsyncMock(return_value="Mozilla/5.0 HeadlessChrome/1 Safari/537.36")
+    page.close = AsyncMock()
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config()) as s:
+        await s._browser_user_agent(browser)
+        await s._browser_user_agent(browser)
+    assert page.evaluate.await_count == 1
+
+
+async def test_a_failure_to_read_the_user_agent_is_not_fatal():
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(side_effect=RuntimeError("no page"))
+    async with Scraper(_config()) as s:
+        assert await s._browser_user_agent(browser) == ""
