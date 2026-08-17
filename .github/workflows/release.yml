@@ -6,6 +6,11 @@ on:
 
 jobs:
   publish:
+    # Parked until PyPI trusted publishing is configured. Without this guard a
+    # `v*` tag — which cutting any GitHub release creates — fires a run that
+    # fails on `uv publish`, leaving a red X on the repo. Set the repository
+    # variable PYPI_ENABLED=true once the PyPI side is set up.
+    if: vars.PYPI_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
