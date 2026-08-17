@@ -40,6 +40,12 @@ fetched and painted anything. Reading content() straight after it is a race that
 returns the empty shell — the exact case js_render exists for.
 """
 
+_MAX_ACTIONS = 20
+_MAX_SCROLLS = 30
+_SCROLL_PAUSE_MS = 900
+_ACTION_TIMEOUT_MS = 10_000
+"""Bounds on page interaction, so a runaway loop cannot hang a fetch."""
+
 _PDF_MAX_PAGES = 100
 """Cap on PDF pages extracted, so a 2,000-page document cannot stall a fetch."""
 
@@ -77,6 +83,10 @@ _CHALLENGE_SIGNATURES = (
     # entirely, so only the body reveals it.
     "verify that you're not a robot",
     "verify that you&#x27;re not a robot",
+    # DuckDuckGo's own challenge, also under HTTP 202. Without this the search tool
+    # parsed a challenge page and reported zero results as though the query simply
+    # matched nothing.
+    "bots use DuckDuckGo too",
 )
 """Every entry is specific enough that ordinary prose cannot trigger it. Matching the
 bare phrase 'Just a moment' would silently blank real pages."""
@@ -116,6 +126,7 @@ class Scraper:
         self._stealth_browser: Browser | None = None
         self._stealth_cm: Any = None
         self._stealth_lock = asyncio.Lock()
+        self.last_action_log: list[str] = []
 
     async def __aenter__(self) -> Scraper:
         self._client = httpx.AsyncClient(
@@ -167,17 +178,19 @@ class Scraper:
         wait_ms: int | None = None,
         wait_for: str = "",
         main_content: bool | None = None,
+        actions: list[dict[str, Any]] | None = None,
     ) -> FetchResult:
         _validate_url(url)
-        # A tuned wait means the caller wants a fresh render, not a cached one.
-        use_cache = wait_ms is None and not wait_for
+        # A tuned wait or a scripted interaction means the caller wants a fresh
+        # render, not whatever was cached earlier.
+        use_cache = wait_ms is None and not wait_for and not actions
         cached = self._cache.get(url, js_render) if use_cache else None
         if cached is not None:
             return replace(cached, from_cache=True)
 
         if js_render:
             html, status, content_type, via = await self._fetch_rendered_with_fallback(
-                url, wait_ms=wait_ms, wait_for=wait_for
+                url, wait_ms=wait_ms, wait_for=wait_for, actions=actions
             )
         else:
             html, status, content_type, via = await self._fetch_static_escalating(url)
@@ -188,7 +201,12 @@ class Scraper:
         return result
 
     async def _fetch_rendered_with_fallback(
-        self, url: str, *, wait_ms: int | None = None, wait_for: str = ""
+        self,
+        url: str,
+        *,
+        wait_ms: int | None = None,
+        wait_for: str = "",
+        actions: list[dict[str, Any]] | None = None,
     ) -> tuple[str, int, str, str]:
         """Render in a browser, but fall back to TLS impersonation if that is blocked.
 
@@ -200,7 +218,7 @@ class Scraper:
         """
         try:
             html, status, content_type = await self._fetch_rendered(
-                url, wait_ms=wait_ms, wait_for=wait_for
+                url, wait_ms=wait_ms, wait_for=wait_for, actions=actions
             )
         except Exception as exc:  # noqa: BLE001
             if not self._config.impersonate:
@@ -378,6 +396,63 @@ class Scraper:
             self._stealth_browser = browser
             return self._stealth_browser
 
+    async def capture_network(
+        self,
+        url: str,
+        *,
+        wait_ms: int | None = None,
+        wait_for: str = "",
+        include_types: tuple[str, ...] = ("json",),
+        max_body_chars: int = 20_000,
+    ) -> list[dict[str, Any]]:
+        """Record the requests a page makes while rendering.
+
+        A JavaScript page usually gets its data from an API the browser calls. Reading
+        that directly is cleaner and far cheaper than parsing the rendered markup, and
+        it survives redesigns that would break any selector.
+        """
+        _validate_url(url)
+        browser = await self._ensure_browser()
+        await self._rate_limiter.wait(url)
+        captured: list[dict[str, Any]] = []
+
+        async with self._semaphore:
+            page = await browser.new_page(user_agent=_USER_AGENT)
+
+            async def on_response(response: Any) -> None:
+                try:
+                    content_type = (response.headers or {}).get("content-type", "")
+                    if not any(kind in content_type.lower() for kind in include_types):
+                        return
+                    entry: dict[str, Any] = {
+                        "url": response.url,
+                        "method": response.request.method,
+                        "status": response.status,
+                        "content_type": content_type,
+                    }
+                    try:
+                        body = await response.text()
+                        entry["size"] = len(body)
+                        entry["body"] = body[:max_body_chars]
+                        entry["body_truncated"] = len(body) > max_body_chars
+                    except Exception:  # noqa: BLE001 - body may be gone already
+                        entry["size"] = 0
+                        entry["body"] = ""
+                        entry["body_truncated"] = False
+                    captured.append(entry)
+                except Exception:  # noqa: BLE001 - a listener must never break the page
+                    log.debug("Failed to record a response", exc_info=True)
+
+            page.on("response", on_response)
+            try:
+                await page.goto(url, timeout=int(_TIMEOUT_S * 1000))
+                await self._settle(
+                    page, _RENDER_SETTLE_MS if wait_ms is None else max(0, wait_ms), wait_for
+                )
+            finally:
+                await page.close()
+        return captured
+
     async def _fetch_stealth(self, url: str, *, wait_for: str = "") -> tuple[str, int, str]:
         browser = await self._ensure_stealth_browser()
         await self._rate_limiter.wait(url)
@@ -399,7 +474,12 @@ class Scraper:
         return html, status, content_type
 
     async def _fetch_rendered(
-        self, url: str, *, wait_ms: int | None = None, wait_for: str = ""
+        self,
+        url: str,
+        *,
+        wait_ms: int | None = None,
+        wait_for: str = "",
+        actions: list[dict[str, Any]] | None = None,
     ) -> tuple[str, int, str]:
         browser = await self._ensure_browser()
         await self._rate_limiter.wait(url)
@@ -413,10 +493,87 @@ class Scraper:
                     response.headers.get("content-type", "") if response is not None else ""
                 )
                 await self._settle(page, settle, wait_for)
+                if actions:
+                    self.last_action_log = await self.run_actions(page, actions)
                 html = await page.content()
             finally:
                 await page.close()
         return html, status, content_type
+
+    async def run_actions(self, page: Any, actions: list[dict[str, Any]]) -> list[str]:
+        """Drive a page before reading it: click, scroll, type, wait.
+
+        Covers the cases a plain fetch cannot reach — cookie gates, "load more"
+        buttons, infinite scroll, and search forms. Each action reports what
+        happened, so a step that silently did nothing is visible rather than
+        leaving you wondering why the page looks unchanged.
+        """
+        log: list[str] = []
+        for step in actions[:_MAX_ACTIONS]:
+            kind = str(step.get("action", "")).lower()
+            selector = str(step.get("selector", ""))
+            try:
+                if kind == "click":
+                    await page.click(selector, timeout=_ACTION_TIMEOUT_MS)
+                    log.append(f"clicked {selector}")
+                elif kind == "type":
+                    await page.fill(selector, str(step.get("text", "")), timeout=_ACTION_TIMEOUT_MS)
+                    log.append(f"typed into {selector}")
+                elif kind == "press":
+                    await page.press(selector or "body", str(step.get("key", "Enter")))
+                    log.append(f"pressed {step.get('key', 'Enter')}")
+                elif kind == "scroll":
+                    rounds = int(step.get("times", 1))
+                    await self._scroll(page, rounds)
+                    log.append(f"scrolled {rounds}x")
+                elif kind == "scroll_to_bottom":
+                    grew = await self._scroll_until_stable(page, int(step.get("max_rounds", 10)))
+                    log.append(f"scrolled to bottom after {grew} rounds")
+                elif kind == "click_until_gone":
+                    clicks = await self._click_until_gone(
+                        page, selector, int(step.get("max_clicks", 10))
+                    )
+                    log.append(f"clicked {selector} {clicks}x until it disappeared")
+                elif kind == "wait":
+                    await page.wait_for_timeout(int(step.get("ms", 1000)))
+                    log.append(f"waited {step.get('ms', 1000)}ms")
+                elif kind == "wait_for":
+                    await page.wait_for_selector(selector, timeout=_ACTION_TIMEOUT_MS)
+                    log.append(f"waited for {selector}")
+                else:
+                    log.append(f"skipped unknown action {kind!r}")
+            except Exception as exc:  # noqa: BLE001 - one bad step must not abort the rest
+                log.append(f"{kind} on {selector!r} failed: {_brief(exc)}")
+        return log
+
+    async def _scroll(self, page: Any, times: int) -> None:
+        for _ in range(max(1, min(times, _MAX_SCROLLS))):
+            await page.mouse.wheel(0, 4000)
+            await page.wait_for_timeout(_SCROLL_PAUSE_MS)
+
+    async def _scroll_until_stable(self, page: Any, max_rounds: int) -> int:
+        """Scroll until the page stops growing — infinite-scroll listings."""
+        previous = 0
+        for round_number in range(1, max(1, min(max_rounds, _MAX_SCROLLS)) + 1):
+            await page.mouse.wheel(0, 6000)
+            await page.wait_for_timeout(_SCROLL_PAUSE_MS)
+            height = await page.evaluate("document.body.scrollHeight")
+            if height == previous:
+                return round_number
+            previous = height
+        return max_rounds
+
+    async def _click_until_gone(self, page: Any, selector: str, max_clicks: int) -> int:
+        """Press a "load more" button until it stops being there."""
+        clicks = 0
+        for _ in range(max(1, min(max_clicks, _MAX_SCROLLS))):
+            try:
+                await page.click(selector, timeout=_ACTION_TIMEOUT_MS)
+            except Exception:  # noqa: BLE001 - gone or never there; either way, done
+                return clicks
+            clicks += 1
+            await page.wait_for_timeout(_SCROLL_PAUSE_MS)
+        return clicks
 
     async def _settle(self, page: Any, settle_ms: int, wait_for: str) -> None:
         """Give a client-rendered page time to populate before reading it."""

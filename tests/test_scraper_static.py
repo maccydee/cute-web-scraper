@@ -481,3 +481,17 @@ async def test_main_content_can_be_forced_off(httpx_mock):
     async with Scraper(_config()) as s:
         result = await s.fetch("https://news.example/story", main_content=False)
     assert "Copyright 2026" in result.markdown
+
+
+async def test_search_engine_challenge_is_a_block(httpx_mock):
+    """DuckDuckGo serves its challenge under HTTP 202. Undetected, the search tool
+    parsed the challenge page and reported zero results as if nothing matched."""
+    httpx_mock.add_response(
+        status_code=202,
+        html="<html><body><p>Unfortunately, bots use DuckDuckGo too. Please complete "
+        "the following challenge.</p></body></html>",
+    )
+    async with Scraper(_config()) as s:
+        result = await s.fetch("https://lite.duckduckgo.com/lite/?q=x")
+    assert result.blocked is True
+    assert result.block_reason == "challenge"

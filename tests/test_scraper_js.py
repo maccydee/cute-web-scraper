@@ -387,3 +387,163 @@ async def test_a_disconnected_browser_is_relaunched():
         ):
             result = await s.fetch("https://example.com", js_render=True)
     assert "# back" in result.markdown
+
+
+# ------------------------------------------------- network capture & actions
+
+
+def _fake_response(url, ctype="application/json", body='{"items":[1,2,3]}', status=200):
+    r = AsyncMock()
+    r.url = url
+    r.status = status
+    r.headers = {"content-type": ctype}
+    r.request = type("Req", (), {"method": "GET"})()
+    r.text = AsyncMock(return_value=body)
+    return r
+
+
+def _page_with_responses(responses):
+    page = AsyncMock()
+    page.content = AsyncMock(return_value="<h1>ok</h1>")
+    page.goto = AsyncMock(return_value=None)
+    handlers = {}
+    page.on = lambda event, fn: handlers.setdefault(event, fn)
+    page._handlers = handlers
+    page._responses = responses
+
+    async def goto(*a, **k):
+        for resp in responses:
+            await handlers["response"](resp)
+        return None
+
+    page.goto = AsyncMock(side_effect=goto)
+    return page
+
+
+async def test_network_capture_keeps_json_and_drops_the_rest():
+    """The JSON behind a JS page is the data; the CSS and images are not."""
+    page = _page_with_responses(
+        [
+            _fake_response("https://api.example/products", body='{"products":[{"id":1}]}'),
+            _fake_response("https://cdn.example/app.css", ctype="text/css", body="body{}"),
+            _fake_response("https://cdn.example/logo.png", ctype="image/png", body=""),
+        ]
+    )
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+
+    async with Scraper(_config()) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            captured = await s.capture_network("https://shop.example")
+
+    assert len(captured) == 1
+    assert captured[0]["url"] == "https://api.example/products"
+    assert '"products"' in captured[0]["body"]
+    assert captured[0]["status"] == 200
+
+
+async def test_network_capture_can_widen_beyond_json():
+    page = _page_with_responses(
+        [_fake_response("https://cdn.example/app.css", ctype="text/css", body="body{}")]
+    )
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+    async with Scraper(_config()) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            captured = await s.capture_network("https://x.example", include_types=("css",))
+    assert len(captured) == 1
+
+
+async def test_network_capture_truncates_large_bodies():
+    page = _page_with_responses([_fake_response("https://api.example/big", body="x" * 50_000)])
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+    async with Scraper(_config()) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            captured = await s.capture_network("https://x.example", max_body_chars=100)
+    assert len(captured[0]["body"]) == 100
+    assert captured[0]["body_truncated"] is True
+    assert captured[0]["size"] == 50_000
+
+
+async def test_actions_run_in_order_and_report_what_happened():
+    page = AsyncMock()
+    page.click = AsyncMock()
+    page.fill = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+    async with Scraper(_config()) as s:
+        log = await s.run_actions(
+            page,
+            [
+                {"action": "click", "selector": "#accept"},
+                {"action": "type", "selector": "#q", "text": "trainers"},
+                {"action": "wait", "ms": 500},
+            ],
+        )
+    assert "clicked #accept" in log[0]
+    assert "typed into #q" in log[1]
+    page.click.assert_awaited_once()
+    page.fill.assert_awaited_once()
+
+
+async def test_a_failing_action_does_not_abort_the_rest():
+    page = AsyncMock()
+    page.click = AsyncMock(side_effect=RuntimeError("no such element"))
+    page.wait_for_timeout = AsyncMock()
+    async with Scraper(_config()) as s:
+        log = await s.run_actions(
+            page, [{"action": "click", "selector": "#missing"}, {"action": "wait", "ms": 10}]
+        )
+    assert "failed" in log[0]
+    assert "waited" in log[1]
+
+
+async def test_unknown_actions_are_reported_not_silently_ignored():
+    page = AsyncMock()
+    async with Scraper(_config()) as s:
+        log = await s.run_actions(page, [{"action": "teleport", "selector": "x"}])
+    assert "unknown action" in log[0]
+
+
+async def test_scroll_to_bottom_stops_when_the_page_stops_growing():
+    page = AsyncMock()
+    page.mouse.wheel = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+    heights = iter([1000, 2000, 2000])
+    page.evaluate = AsyncMock(side_effect=lambda _: next(heights))
+    async with Scraper(_config()) as s:
+        log = await s.run_actions(page, [{"action": "scroll_to_bottom", "max_rounds": 10}])
+    assert "scrolled to bottom after 3 rounds" in log[0]
+
+
+async def test_click_until_gone_stops_when_the_button_disappears():
+    page = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+    calls = {"n": 0}
+
+    async def click(selector, timeout=None):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise RuntimeError("gone")
+
+    page.click = AsyncMock(side_effect=click)
+    async with Scraper(_config()) as s:
+        log = await s.run_actions(page, [{"action": "click_until_gone", "selector": ".more"}])
+    assert "3x until it disappeared" in log[0]
+
+
+async def test_actions_bypass_the_cache():
+    """A scripted interaction wants a fresh page, not whatever was cached."""
+    page = AsyncMock()
+    page.content = AsyncMock(return_value="<h1>ok</h1>")
+    page.goto = AsyncMock(return_value=None)
+    page.click = AsyncMock()
+    browser = AsyncMock()
+    browser.new_page = AsyncMock(return_value=page)
+    async with Scraper(_config(cache_ttl_s=300)) as s:
+        with patch.object(Scraper, "_ensure_browser", new=AsyncMock(return_value=browser)):
+            await s.fetch("https://x.example", js_render=True)
+            acted = await s.fetch(
+                "https://x.example", js_render=True, actions=[{"action": "click", "selector": "#a"}]
+            )
+    assert acted.from_cache is False

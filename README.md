@@ -35,7 +35,9 @@ Scrape every product from https://example-shop.com and give me a CSV of name and
 
 | Tool | What it does |
 |---|---|
+| `search_web` | Search the web and get ranked results — the way in when you have a question, not a URL |
 | `fetch_page` | One URL to clean markdown, with title, status and link count |
+| `inspect_network` | Report the API calls a page makes, with their JSON — read the data source directly |
 | `fetch_pages` | Many URLs in parallel, returning results and per-URL errors |
 | `crawl_site` | Discover a site's pages via sitemap, falling back to link-following |
 | `analyze_website` | Detect the platform, find the sitemap, report whether JS is needed |
@@ -59,6 +61,14 @@ Scrape every product from https://example-shop.com and give me a CSV of name and
 |---|---|
 | `find_places` | Search by name or description — name, address, coordinates, phone, website, opening hours |
 | `find_places_nearby` | Every business of a category within a radius of a place |
+
+**Change tracking**
+
+| Tool | What it does |
+|---|---|
+| `track_changes` | Fetch a page and diff it against the last check — new, same or changed |
+| `list_tracked` | Pages being watched, and when each was last seen |
+| `untrack` | Stop watching a page |
 
 **Result tables**
 
@@ -86,6 +96,33 @@ save it as `catalogue`, then show me anything under £50.
 ```json
 {"name": "h3 a@title", "price": ".price_color", "link": "h3 a@href"}
 ```
+
+### Driving a page
+
+`fetch_page` takes `actions`, which run before the page is read — cookie gates, "load more" buttons, infinite scroll and search forms:
+
+```json
+[{"action": "click", "selector": "#accept-cookies"},
+ {"action": "scroll_to_bottom", "max_rounds": 10}]
+```
+
+Available actions: `click`, `type`, `press`, `wait`, `wait_for`, `scroll`, `scroll_to_bottom` and `click_until_gone`. Each reports what it did, so a step that silently matched nothing is visible rather than leaving you guessing.
+
+### Reading the API instead of the page
+
+When a site is awkward to parse, `inspect_network` renders it and reports the requests it made. A JavaScript page almost always loads its data from an endpoint you can fetch directly — cheaper than parsing markup, and it survives redesigns that break selectors:
+
+```
+Inspect the network on this listing page, then fetch whatever JSON endpoint it uses.
+```
+
+### Watching for changes
+
+```
+Check https://example.com/pricing for changes.
+```
+
+`track_changes` stores a snapshot and reports `new`, `same` or `changed` with a unified diff. That is monitoring without a scheduler — check whenever you like and see only the difference.
 
 ### Slash commands
 

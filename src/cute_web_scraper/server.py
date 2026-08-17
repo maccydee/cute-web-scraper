@@ -43,6 +43,7 @@ class ScraperHolder:
         self._scraper: Any = scraper
         self._store = store
         self._config = config
+        self._snapshots: Any = None
 
     def set(
         self, scraper: Any, store: ResultStore | None = None, config: Config | None = None
@@ -50,6 +51,7 @@ class ScraperHolder:
         self._scraper = scraper
         if store is not None:
             self._store = store
+            self._snapshots = None
         if config is not None:
             self._config = config
 
@@ -57,6 +59,13 @@ class ScraperHolder:
         if self._scraper is None:
             raise RuntimeError("Scraper is not initialised; the server lifespan did not run")
         return self._scraper
+
+    def require_snapshots(self) -> Any:
+        from .store import SnapshotStore
+
+        if self._snapshots is None:
+            self._snapshots = SnapshotStore(self.require_store())
+        return self._snapshots
 
     def require_store(self) -> ResultStore:
         if self._store is None:
@@ -77,6 +86,9 @@ def create_server(holder: ScraperHolder) -> MCPServer:
     _register_extract_tools(mcp, holder)
     _register_product_tools(mcp, holder)
     _register_selector_tool(mcp, holder)
+    _register_discovery_search(mcp, holder)
+    _register_network_tool(mcp, holder)
+    _register_change_tools(mcp, holder)
     _register_shopify_tools(mcp, holder)
     _register_place_tools(mcp, holder)
     _register_table_tools(mcp, holder)
@@ -178,7 +190,12 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             "more reliable than a fixed delay. "
             "Article-shaped pages have their navigation, cookie banners and footers "
             "stripped automatically; set main_content=false to keep the whole page. "
-            "PDFs are extracted to text."
+            "PDFs are extracted to text.\n\n"
+            "`actions` drives the page before reading it (implies js_render). Each is "
+            "{action, selector, ...}: click, type (text), press (key), wait (ms), "
+            "wait_for, scroll (times), scroll_to_bottom (max_rounds) for infinite "
+            "scroll, and click_until_gone (max_clicks) for a 'load more' button. "
+            "Use it for cookie gates, paginated listings and search forms."
         )
     )
     async def fetch_page(
@@ -187,23 +204,30 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         wait_ms: int = 0,
         wait_for: str = "",
         main_content: bool = True,
+        actions: list[dict[str, Any]] | None = None,
     ) -> str:
         log.debug("tool=fetch_page url=%s js_render=%s", url, js_render)
         try:
-            result = await holder.require().fetch(
+            scraper = holder.require()
+            result = await scraper.fetch(
                 url,
-                js_render=js_render,
+                # Driving a page only makes sense in a browser.
+                js_render=js_render or bool(actions),
                 wait_ms=wait_ms or None,
                 wait_for=wait_for,
                 # True means "decide per page"; only an explicit false forces the
                 # whole document.
                 main_content=None if main_content else False,
+                actions=actions,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller as text
             log.error("tool=fetch_page failed: %s", exc)
             return f"Error fetching {url}: {_describe(exc)}"
 
         rendered = _render_page(result)
+        performed = getattr(scraper, "last_action_log", None) if actions else None
+        if performed:
+            rendered = "actions: " + "; ".join(performed) + "\n\n" + rendered
         if len(rendered) <= holder.max_inline_chars or result.blocked:
             return rendered
         # Keep the whole page rather than lopping off its tail: save it and hand
@@ -418,6 +442,143 @@ def _build_extract_tool(
         )
 
     return _extract
+
+
+def _register_discovery_search(mcp: MCPServer, holder: ScraperHolder) -> None:
+    @mcp.tool(
+        description=(
+            "Search the web and get back ranked results with titles, URLs and "
+            "snippets — the way in when you have a question rather than a URL. "
+            "Feed the urls straight into fetch_pages or extract_by_selector. "
+            "No API key and no quota."
+        )
+    )
+    async def search_web(query: str, limit: int = 10, save_as: str = "") -> str:
+        from .search import SearchError, parse_results, search_url
+
+        try:
+            target = search_url(query)
+        except SearchError as exc:
+            return json.dumps({"query": query, "error": str(exc), "results": []})
+        try:
+            page = await holder.require().fetch(target, main_content=False)
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"query": query, "error": _describe(exc), "results": []})
+        if page.blocked:
+            return json.dumps(
+                {
+                    "query": query,
+                    "error": f"the search engine blocked the request ({page.block_reason})",
+                    "results": [],
+                }
+            )
+        results = parse_results(page.html, limit=limit)
+        return _emit_rows(
+            holder,
+            "search_web",
+            {"query": query, "count": len(results), "results": results},
+            results,
+            [],
+            save_as,
+        )
+
+
+def _register_network_tool(mcp: MCPServer, holder: ScraperHolder) -> None:
+    @mcp.tool(
+        description=(
+            "Render a page and report the API calls it makes, with their JSON "
+            "responses. A JavaScript site usually loads its data from an endpoint you "
+            "can read directly — cleaner and far cheaper than parsing rendered markup, "
+            "and it survives redesigns that break selectors. Use this when a page is "
+            "hard to scrape, then fetch the endpoint it reveals. "
+            "Set include_types to widen beyond JSON."
+        )
+    )
+    async def inspect_network(
+        url: str,
+        wait_ms: int = 0,
+        wait_for: str = "",
+        include_types: str = "json",
+        max_body_chars: int = 4000,
+        save_as: str = "",
+    ) -> str:
+        kinds = tuple(k.strip().lower() for k in include_types.split(",") if k.strip())
+        try:
+            captured = await holder.require().capture_network(
+                url,
+                wait_ms=wait_ms or None,
+                wait_for=wait_for,
+                include_types=kinds or ("json",),
+                max_body_chars=max_body_chars,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"url": url, "error": _describe(exc), "results": []})
+        captured.sort(key=lambda r: int(r.get("size", 0)), reverse=True)
+        return _emit_rows(
+            holder,
+            "inspect_network",
+            {
+                "url": url,
+                "count": len(captured),
+                "note": "Sorted biggest first — the largest JSON response is usually the data.",
+                "results": captured,
+            },
+            captured,
+            [],
+            save_as,
+        )
+
+
+def _register_change_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
+    @mcp.tool(
+        description=(
+            "Fetch a page and report what changed since the last time it was checked. "
+            "Returns status 'new', 'same' or 'changed', with a unified diff and line "
+            "counts when it changed. This is monitoring without a scheduler: check a "
+            "price, a job board or a policy page whenever you want and see only the "
+            "difference."
+        )
+    )
+    async def track_changes(url: str, js_render: bool = False, context_lines: int = 2) -> str:
+        from datetime import datetime, timezone
+
+        try:
+            page = await holder.require().fetch(url, js_render=js_render)
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"url": url, "error": _describe(exc)})
+        if page.blocked:
+            return json.dumps({"url": url, "error": f"blocked: {page.block_reason}"})
+
+        change = holder.require_snapshots().compare(
+            url,
+            page.markdown,
+            seen_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            context=context_lines,
+        )
+        return _truncate(
+            json.dumps(
+                {
+                    "url": change.url,
+                    "status": change.status,
+                    "previous_seen_at": change.previous_seen_at,
+                    "added_lines": change.added_lines,
+                    "removed_lines": change.removed_lines,
+                    "diff": change.diff,
+                    "title": page.title,
+                },
+                ensure_ascii=False,
+            ),
+            holder.max_inline_chars,
+        )
+
+    @mcp.tool(description="List the pages being tracked for changes, with when each was last seen.")
+    async def list_tracked() -> str:
+        tracked = holder.require_snapshots().tracked()
+        return json.dumps({"count": len(tracked), "tracked": tracked}, ensure_ascii=False)
+
+    @mcp.tool(description="Stop tracking a page and forget its stored snapshot.")
+    async def untrack(url: str) -> str:
+        return json.dumps({"url": url, "forgotten": holder.require_snapshots().forget(url)})
 
 
 def _register_selector_tool(mcp: MCPServer, holder: ScraperHolder) -> None:

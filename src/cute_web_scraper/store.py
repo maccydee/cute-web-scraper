@@ -7,6 +7,8 @@ filtered and aggregated without any of it entering the model's context.
 from __future__ import annotations
 
 import csv
+import difflib
+import hashlib
 import json
 import re
 import sqlite3
@@ -44,6 +46,8 @@ _STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
 _DEFAULT_MAX_ROWS = 200
 _MAX_MATERIALISED_ROWS = 100_000
 _EXPORT_FORMATS = ("csv", "json")
+_MAX_DIFF_LINES = 200
+"""Diffs are summaries, not payloads; a full one can be larger than the page."""
 
 
 class StoreError(Exception):
@@ -133,7 +137,8 @@ class ResultStore:
                 str(r["name"])
                 for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                    "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_%' ESCAPE '\\' "
+                    "ORDER BY name"
                 )
             ]
         return [self.get_table(n, sample=0) for n in names]
@@ -309,3 +314,96 @@ def _coerce(value: Any) -> Any:
     if isinstance(value, bool):
         return int(value)
     return json.dumps(value, ensure_ascii=False)
+
+
+_SNAPSHOT_TABLE = "_snapshots"
+"""Underscore-prefixed so it does not appear in list_tables alongside result data."""
+
+
+@dataclass
+class Change:
+    url: str
+    status: str
+    """new, same, or changed."""
+    previous_seen_at: str | None
+    added_lines: int
+    removed_lines: int
+    diff: str
+
+
+class SnapshotStore:
+    """Content snapshots, so a re-scrape can say what actually changed.
+
+    This is the monitoring case without a scheduler: fetch now, fetch again next
+    week, and get a diff rather than two walls of text to compare by eye.
+    """
+
+    def __init__(self, store: ResultStore) -> None:
+        self._store = store
+        with self._store._connect() as conn:
+            conn.execute(
+                f'CREATE TABLE IF NOT EXISTS "{_SNAPSHOT_TABLE}" ('
+                "url TEXT PRIMARY KEY, content TEXT NOT NULL, "
+                "digest TEXT NOT NULL, seen_at TEXT NOT NULL)"
+            )
+
+    def compare(self, url: str, content: str, *, seen_at: str, context: int = 2) -> Change:
+        """Diff `content` against the stored snapshot and replace it."""
+        digest = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+        with self._store._connect() as conn:
+            row = conn.execute(
+                f'SELECT content, digest, seen_at FROM "{_SNAPSHOT_TABLE}" WHERE url = ?', (url,)
+            ).fetchone()
+
+        if row is None:
+            status, previous, added, removed, diff = "new", None, 0, 0, ""
+        elif str(row["digest"]) == digest:
+            status, previous, added, removed, diff = "same", str(row["seen_at"]), 0, 0, ""
+        else:
+            previous = str(row["seen_at"])
+            status = "changed"
+            added, removed, diff = _diff(str(row["content"]), content, context)
+
+        with self._store._connect() as conn:
+            conn.execute(
+                f'INSERT INTO "{_SNAPSHOT_TABLE}" (url, content, digest, seen_at) '
+                "VALUES (?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET "
+                "content=excluded.content, digest=excluded.digest, seen_at=excluded.seen_at",
+                (url, content, digest, seen_at),
+            )
+        return Change(
+            url=url,
+            status=status,
+            previous_seen_at=previous,
+            added_lines=added,
+            removed_lines=removed,
+            diff=diff,
+        )
+
+    def forget(self, url: str) -> bool:
+        with self._store._connect() as conn:
+            cursor = conn.execute(f'DELETE FROM "{_SNAPSHOT_TABLE}" WHERE url = ?', (url,))
+            return cursor.rowcount > 0
+
+    def tracked(self) -> list[dict[str, Any]]:
+        with self._store._connect() as conn:
+            return [
+                {"url": str(r["url"]), "seen_at": str(r["seen_at"]), "size": len(str(r["content"]))}
+                for r in conn.execute(
+                    f'SELECT url, seen_at, content FROM "{_SNAPSHOT_TABLE}" ORDER BY url'
+                )
+            ]
+
+
+def _diff(before: str, after: str, context: int) -> tuple[int, int, str]:
+    lines = list(
+        difflib.unified_diff(
+            before.splitlines(), after.splitlines(), "before", "after", n=context, lineterm=""
+        )
+    )
+    added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
+    body = "\n".join(lines[:_MAX_DIFF_LINES])
+    if len(lines) > _MAX_DIFF_LINES:
+        body += f"\n[diff truncated: {len(lines)} lines total]"
+    return added, removed, body
