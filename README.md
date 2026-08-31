@@ -18,7 +18,7 @@ Ask in plain English. It fetches the pages, renders the JavaScript when needed, 
 
 ### Why this one
 
-- **It gets in.** Four escalating tiers — plain HTTP, browser TLS fingerprints, a real browser, then a stealth browser. ASOS, eBay, Booking.com and Trustpilot all return real data, on a home connection with no proxies.
+- **It gets in, for free.** Four escalating tiers — plain HTTP, browser TLS fingerprints, a real browser, then a stealth browser. ASOS, eBay, Booking.com and Trustpilot all return real data on a home connection, with no proxies, no API key and no per-page cost. Hosted scrapers put their anti-bot behind metered credits and leave it out of their open-source builds; the two fingerprint tiers here are the ones that actually got past those four sites, and they cost nothing.
 - **It doesn't waste your context.** Articles are stripped of navigation, cookie banners and footers: a BBC news page goes from **20,513 characters to 3,198**. Large results land in a SQLite table you query with SQL instead of pasting into the chat.
 - **It tells the truth about failure.** Five of the sites tested served a refusal under a *success* status — an interstitial under HTTP 200, a bot check under 202 — and one served real content under 403. Block detection weighs the page body, not the status code, so you don't get a stub reported as data.
 - **Whole sites, not single pages.** Sitemap discovery, parallel fetching, and 25 tools covering products, contacts, Shopify catalogues, places, screenshots and change tracking.
@@ -262,7 +262,7 @@ It binds `127.0.0.1` and exposes `/mcp` plus a `/health` endpoint. Binding anywh
 
 ## Limitations
 
-- No proxy rotation and no CAPTCHA solving. A site that survives all four tiers is reported as blocked rather than guessed at.
+- **No proxy rotation and no CAPTCHA solving.** This is the real ceiling: the tiers here defeat TLS and browser fingerprinting, not IP reputation. A site that blocks your address or geo-fences its content needs a proxy network, and a paid service with residential proxies will beat this on those. A site that survives all four tiers is reported as blocked rather than guessed at.
 - LinkedIn and similar may need `SCRAPER_CHROME_USER_DATA_DIR` pointed at a logged-in Chrome profile.
 - `SCRAPER_DELAY_MS=0` removes the polite delay, but backoff still engages when a site pushes back.
 - Phone extraction is deliberately conservative: it requires a country code or a trunk prefix, so it misses some bare local formats rather than returning years and order numbers.
