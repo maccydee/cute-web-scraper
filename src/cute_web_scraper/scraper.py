@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -47,6 +48,7 @@ _ACTION_TIMEOUT_MS = 10_000
 """Bounds on page interaction, so a runaway loop cannot hang a fetch."""
 
 _PDF_MAX_PAGES = 100
+_SHEET_MAX_ROWS = 500
 """Cap on PDF pages extracted, so a 2,000-page document cannot stall a fetch."""
 
 _STEALTH_SETTLE_MS = 4000
@@ -396,6 +398,50 @@ class Scraper:
             self._stealth_cm = cm
             self._stealth_browser = browser
             return self._stealth_browser
+
+    async def screenshot(
+        self,
+        url: str,
+        path: Path,
+        *,
+        full_page: bool = True,
+        width: int = 1280,
+        height: int = 800,
+        wait_ms: int | None = None,
+        wait_for: str = "",
+        actions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Render a page and write a PNG to `path`.
+
+        Returned rather than inlined as base64 on purpose: a full-page screenshot is
+        routinely over a megabyte, and pasting that into the conversation would cost
+        more context than the page it depicts. The caller gets a file path to open.
+        """
+        browser = await self._ensure_browser()
+        await self._rate_limiter.wait(url)
+        async with self._semaphore:
+            page = await browser.new_page(
+                user_agent=await self._browser_user_agent(browser),
+                viewport={"width": width, "height": height},
+            )
+            try:
+                response = await page.goto(url, timeout=int(_TIMEOUT_S * 1000))
+                await self._settle(page, wait_ms or _RENDER_SETTLE_MS, wait_for)
+                performed = await self.run_actions(page, actions) if actions else []
+                path.parent.mkdir(parents=True, exist_ok=True)
+                await page.screenshot(path=str(path), full_page=full_page)
+                title = await page.title()
+            finally:
+                await page.close()
+        return {
+            "url": url,
+            "path": str(path),
+            "title": title,
+            "status_code": response.status if response else 0,
+            "full_page": full_page,
+            "bytes": path.stat().st_size if path.exists() else 0,
+            "actions": performed,
+        }
 
     async def capture_network(
         self,
@@ -775,6 +821,47 @@ def _is_pdf(content_type: str) -> bool:
     return "pdf" in content_type.lower()
 
 
+_DOCX_TYPES = ("wordprocessingml", "msword")
+_XLSX_TYPES = ("spreadsheetml", "ms-excel")
+
+
+def _office_kind(content_type: str, data: bytes = b"") -> str:
+    """Which Office format this is, or "" for none.
+
+    Linked .docx and .xlsx are common on the sort of pages people scrape -- council
+    minutes, price lists, spec sheets -- and decoding them as text yields zip noise,
+    so without this they come back empty exactly like PDFs used to.
+
+    The content type is checked first but is not trusted: plenty of servers hand back
+    `application/octet-stream` for a spreadsheet (Microsoft's own download link does),
+    which is the same lesson as block detection -- the header is a claim, the body is
+    the evidence. Both formats are zips, so the archive's own entries settle it.
+    """
+    ct = content_type.lower()
+    if any(marker in ct for marker in _DOCX_TYPES):
+        return "docx"
+    if any(marker in ct for marker in _XLSX_TYPES):
+        return "xlsx"
+    return _sniff_office(data) if data[:4] == b"PK\x03\x04" else ""
+
+
+def _sniff_office(data: bytes) -> str:
+    """Identify a docx/xlsx by what the zip actually contains."""
+    try:
+        from io import BytesIO
+        from zipfile import ZipFile
+
+        with ZipFile(BytesIO(data)) as archive:
+            names = set(archive.namelist())
+        if "word/document.xml" in names:
+            return "docx"
+        if "xl/workbook.xml" in names:
+            return "xlsx"
+    except Exception as exc:  # noqa: BLE001 - not a readable zip is simply not Office
+        log.debug("Not a readable Office archive: %s", _brief(exc))
+    return ""
+
+
 def _decode_body(response: Any, content_type: str) -> str:
     """Turn a response into text, including PDFs.
 
@@ -784,7 +871,13 @@ def _decode_body(response: Any, content_type: str) -> str:
     """
     if _is_pdf(content_type):
         return _pdf_to_text(response.content)
-    return str(response.text) if _is_texty(content_type) else ""
+    # Settle the ordinary case before touching raw bytes: an HTML page should never
+    # pay for Office sniffing, and .text is the only attribute some callers provide.
+    if _is_texty(content_type):
+        return str(response.text)
+    body = getattr(response, "content", b"")
+    kind = _office_kind(content_type, body)
+    return _office_to_text(body, kind) if kind else ""
 
 
 def _pdf_to_text(data: bytes) -> str:
@@ -816,9 +909,85 @@ def _pdf_to_text(data: bytes) -> str:
         return ""
 
 
+def _office_to_text(data: bytes, kind: str) -> str:
+    """Extract text from a .docx or .xlsx (python-docx / openpyxl, both MIT).
+
+    Same licence reasoning as the PDF path: nothing here may be copyleft. Headings
+    keep their markdown level so the result reads like the document rather than a
+    wall of paragraphs, and tables become markdown tables so a spreadsheet stays
+    queryable once it lands in a result table.
+    """
+    if not data:
+        return ""
+    try:
+        from io import BytesIO
+
+        if kind == "docx":
+            import docx  # python-docx
+
+            document = docx.Document(BytesIO(data))
+            parts: list[str] = []
+            for para in document.paragraphs:
+                text = para.text.strip()
+                if not text:
+                    continue
+                style = (para.style.name or "") if para.style else ""
+                if style.startswith("Heading"):
+                    level = "".join(c for c in style if c.isdigit()) or "1"
+                    parts.append(f"{'#' * min(int(level) + 1, 6)} {text}")
+                else:
+                    parts.append(text)
+            for table in document.tables:
+                rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+                parts.append(_rows_to_markdown(rows))
+            return "\n\n".join(part for part in parts if part)
+
+        import openpyxl
+
+        book = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+        sheets: list[str] = []
+        for sheet in book.worksheets:
+            rows = []
+            for row in sheet.iter_rows(max_row=_SHEET_MAX_ROWS, values_only=True):
+                cells = ["" if v is None else str(v).strip() for v in row]
+                if any(cells):
+                    rows.append(cells)
+            if not rows:
+                continue
+            body = _rows_to_markdown(rows)
+            if sheet.max_row and sheet.max_row > _SHEET_MAX_ROWS:
+                body += f"\n\n[Truncated: {sheet.max_row} rows, first {_SHEET_MAX_ROWS} extracted]"
+            sheets.append(f"## {sheet.title}\n\n{body}")
+        book.close()
+        return "\n\n".join(sheets)
+    except Exception as exc:  # noqa: BLE001 - a broken document is not a crash
+        log.info("Could not extract %s text: %s", kind, _brief(exc))
+        return ""
+
+
+def _rows_to_markdown(rows: list[list[str]]) -> str:
+    """Render rows as a markdown table, first row as the header."""
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    padded = [r + [""] * (width - len(r)) for r in rows]
+    header, *rest = padded
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * width]
+    lines += ["| " + " | ".join(r) + " |" for r in rest]
+    return "\n".join(lines)
+
+
 def _text_from_document(body: str, content_type: str) -> str:
-    """Non-HTML bodies are already text by the time they get here."""
-    return body if (_is_pdf(content_type) or _is_texty(content_type)) else ""
+    """Non-HTML bodies are already text by the time they get here.
+
+    No content-type gate: `_decode_body` returns "" for anything it could not turn
+    into text, so a non-empty body at this point is by definition already decoded.
+    Re-checking the header here used to blank exactly the files the sniffing was
+    added to rescue -- an .xlsx served as `application/octet-stream` was extracted
+    correctly and then thrown away one call later.
+    """
+    del content_type  # kept for call-site symmetry with the HTML path
+    return body
 
 
 def _is_html(content_type: str, html: str) -> bool:

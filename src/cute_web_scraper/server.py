@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from mcp.server.mcpserver import MCPServer
 
@@ -88,6 +88,7 @@ def create_server(holder: ScraperHolder) -> MCPServer:
     _register_selector_tool(mcp, holder)
     _register_discovery_search(mcp, holder)
     _register_network_tool(mcp, holder)
+    _register_screenshot_tool(mcp, holder)
     _register_change_tools(mcp, holder)
     _register_shopify_tools(mcp, holder)
     _register_place_tools(mcp, holder)
@@ -205,6 +206,7 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
         wait_for: str = "",
         main_content: bool = True,
         actions: list[dict[str, Any]] | None = None,
+        as_html: bool = False,
     ) -> str:
         log.debug("tool=fetch_page url=%s js_render=%s", url, js_render)
         try:
@@ -224,7 +226,7 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
             log.error("tool=fetch_page failed: %s", exc)
             return f"Error fetching {url}: {_describe(exc)}"
 
-        rendered = _render_page(result)
+        rendered = _render_page(result, as_html=as_html)
         performed = getattr(scraper, "last_action_log", None) if actions else None
         if performed:
             rendered = "actions: " + "; ".join(performed) + "\n\n" + rendered
@@ -242,7 +244,7 @@ def _register_fetch_tools(mcp: MCPServer, holder: ScraperHolder) -> None:
                         "title": result.title,
                         "status_code": result.status_code,
                         "links_count": result.links_count,
-                        "markdown": result.markdown,
+                        "markdown": result.html if as_html else result.markdown,
                     }
                 ],
             )
@@ -453,7 +455,9 @@ def _register_discovery_search(mcp: MCPServer, holder: ScraperHolder) -> None:
             "No API key and no quota."
         )
     )
-    async def search_web(query: str, limit: int = 10, save_as: str = "") -> str:
+    async def search_web(
+        query: str, limit: int = 10, save_as: str = "", fetch_content: bool = False
+    ) -> str:
         from .search import SearchError, parse_results, search_url
 
         try:
@@ -473,6 +477,19 @@ def _register_discovery_search(mcp: MCPServer, holder: ScraperHolder) -> None:
                 }
             )
         results = parse_results(page.html, limit=limit)
+        if fetch_content and results:
+            # One call from a question to readable text. Without this the caller has
+            # to round-trip every result through fetch_pages, which is the common
+            # case and costs a whole extra turn.
+            pages, failures = await _gather_pages(
+                holder.require(), [r["url"] for r in results], js_render=False
+            )
+            by_url = {page.url: page.markdown for page in pages}
+            why = {f["url"]: f["error"] for f in failures}
+            for row in results:
+                # The fetch follows redirects, so key on the requested URL too.
+                row["content"] = by_url.get(row["url"], "")
+                row["fetch_error"] = "" if row["content"] else why.get(row["url"], "not retrieved")
         return _emit_rows(
             holder,
             "search_web",
@@ -481,6 +498,66 @@ def _register_discovery_search(mcp: MCPServer, holder: ScraperHolder) -> None:
             [],
             save_as,
         )
+
+
+def _register_screenshot_tool(mcp: MCPServer, holder: ScraperHolder) -> None:
+    @mcp.tool(
+        description=(
+            "Render a page in a browser and save a PNG screenshot to disk, returning "
+            "the file path. Use it to see what a page actually looks like — verifying "
+            "a layout, capturing a chart or map that has no underlying text, keeping "
+            "visual evidence of a listing, or working out why a scrape came back "
+            "sparse. Takes the same `actions` as fetch_page, so you can dismiss a "
+            "cookie banner or scroll before the shot. full_page=true captures the "
+            "whole scrollable page rather than just the viewport."
+        )
+    )
+    async def screenshot_page(
+        url: str,
+        path: str = "",
+        full_page: bool = True,
+        width: int = 1280,
+        height: int = 800,
+        wait_ms: int = 0,
+        wait_for: str = "",
+        actions: list[dict[str, Any]] | None = None,
+    ) -> str:
+        log.debug("tool=screenshot_page url=%s", url)
+        try:
+            target = _screenshot_path(url, path)
+        except ValueError as exc:
+            return json.dumps({"url": url, "error": str(exc)})
+        try:
+            info = await holder.require().screenshot(
+                url,
+                target,
+                full_page=full_page,
+                width=width,
+                height=height,
+                wait_ms=wait_ms or None,
+                wait_for=wait_for,
+                actions=actions,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller as JSON
+            log.error("tool=screenshot_page failed: %s", exc)
+            return json.dumps({"url": url, "error": _describe(exc)})
+        return json.dumps(info, indent=2)
+
+
+def _screenshot_path(url: str, path: str) -> Path:
+    """Where the PNG goes.
+
+    Defaults under the user's home rather than a temp directory: these are files
+    someone opens later, and /tmp is cleared daily.
+    """
+    if path:
+        chosen = Path(path).expanduser()
+        if chosen.suffix.lower() != ".png":
+            chosen = chosen.with_suffix(".png")
+        return chosen
+    host = (urlparse(url).netloc or "page").replace(":", "_")
+    slug = "".join(c if c.isalnum() or c in "-._" else "-" for c in host)[:60]
+    return Path.home() / ".cute-web-scraper" / "screenshots" / f"{slug}.png"
 
 
 def _register_network_tool(mcp: MCPServer, holder: ScraperHolder) -> None:
@@ -1069,7 +1146,7 @@ def _emit_rows(
     return json.dumps(summary, ensure_ascii=False)
 
 
-def _render_page(result: FetchResult) -> str:
+def _render_page(result: FetchResult, *, as_html: bool = False) -> str:
     front_matter = "\n".join(
         [
             "---",
@@ -1089,4 +1166,4 @@ def _render_page(result: FetchResult) -> str:
             "increased the delay for this domain; retrying later may succeed. "
             "For challenge pages, try js_render=true."
         )
-    return f"{front_matter}\n\n{result.markdown}"
+    return f"{front_matter}\n\n{result.html if as_html else result.markdown}"
